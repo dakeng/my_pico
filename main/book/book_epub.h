@@ -33,3 +33,20 @@ esp_err_t book_epub_load_image(book_epub_t *book, size_t index, const char *refe
 uint32_t book_epub_total_bytes(const book_epub_t *book);
 /// 该章之前所有 spine 原始 HTML 字节累计值。/ Sum of source HTML bytes preceding this chapter in the spine.
 uint32_t book_epub_chapter_byte_offset(const book_epub_t *book, size_t index);
+
+typedef struct {
+    char title[160];       ///< 书名（dc:title） / Book title (dc:title)
+    char author[128];      ///< 作者（dc:creator） / Author (dc:creator)
+    bool has_cover;        ///< 是否存在封面图条目 / Whether a cover image entry was found
+    char cover_path[512];  ///< 封面在 ZIP 中的路径 / Cover image path inside the ZIP
+} book_epub_meta_t;
+
+/// 轻量读取 EPUB 的书名、作者和封面路径，不加载章节正文。
+/// Read EPUB title, author and cover ZIP path lightly without loading chapter bodies.
+esp_err_t book_epub_read_meta(const char *path, book_epub_meta_t *out);
+
+/// 解码 EPUB 封面并等比居中裁切为 target_w × target_h 灰度图（8bpp），调用方 free。
+/// Decode EPUB cover and center-crop/scale to target_w x target_h 8bpp grayscale; caller frees output.
+esp_err_t book_epub_load_cover_thumb(
+    const char *path, uint16_t target_w, uint16_t target_h, uint8_t **out_pixels
+);

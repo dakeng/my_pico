@@ -328,3 +328,177 @@ size_t book_layout_image_at(size_t page, EpdRect rect, int x, int y, EpdRect* hi
     }
     return SIZE_MAX;
 }
+
+/* ---- 字符级坐标反查与下划线绘制 / Character hit-test and highlight underlines ---- */
+
+// 计算单行纯文本的有效末尾偏移（不含行尾 CR/LF）。
+// Compute the visible text end offset of a wrapped line (excluding trailing CR/LF).
+static size_t line_visible_end(size_t off, size_t next) {
+    size_t vis = next;
+    while (vis > off && (s_text[vis - 1] == '\n' || s_text[vis - 1] == '\r')) --vis;
+    return vis;
+}
+
+bool book_layout_char_at(
+    size_t page, EpdRect rect, int x, int y,
+    size_t* out_start, size_t* out_end, EpdRect* out_glyph_rect
+) {
+    if (page >= book_layout_page_count() || rect.width != s_rect.width || rect.height != s_rect.height ||
+        rect.x < 0 || rect.y < 0 || rect.x > INT_MAX - rect.width || rect.y > INT_MAX - rect.height) {
+        return false;
+    }
+    size_t off = s_pages[page];
+    size_t end = page + 1 < s_count ? s_pages[page + 1] : s_len;
+    int64_t used = 0;
+
+    // 若手指略超出上下边界，夹到正文区首行或末行，提升拖选连贯性。
+    // Clamp y inside the body rect to keep drag selection smooth near edges.
+    int cy = y < rect.y ? rect.y : (y >= rect.y + rect.height ? rect.y + rect.height - 1 : y);
+    int cx = x < rect.x ? rect.x : (x >= rect.x + rect.width ? rect.x + rect.width - 1 : x);
+
+    bool have_best = false;
+    size_t best_s = 0, best_e = 0;
+    EpdRect best_r = {0};
+
+    while (off < end) {
+        size_t next;
+        bool paragraph_end, heading;
+        int line_px;
+        if (!take_line(off, &next, &paragraph_end, &line_px, &heading)) break;
+        const blk_t* block = block_at(off);
+        int line_h = row_height(block, line_px);
+        if (used + line_h > rect.height) break;
+        int extra = paragraph_end ? line_h / (heading ? 2 : 3) : 0;
+        int line_top = rect.y + (int)used;
+        int line_bot = line_top + line_h + extra;
+
+        if (!(block && (block->image || block->image_src))) {
+            size_t vis_end = line_visible_end(off, next);
+            if (vis_end > off) {
+                int gx = rect.x;
+                size_t cur = off;
+                size_t line_best_s = off, line_best_e = off;
+                EpdRect line_best_r = { rect.x, line_top, 1, line_h };
+                bool matched_x = false;
+
+                while (cur < vis_end) {
+                    size_t n = codepoint_size(s_text + cur, vis_end - cur);
+                    if (!n) break;
+                    char glyph[5];
+                    memcpy(glyph, s_text + cur, n);
+                    glyph[n] = 0;
+                    int gw = ttf_text_width_px(line_px, glyph);
+                    if (gw < 1) gw = 1;
+                    line_best_s = cur;
+                    line_best_e = cur + n;
+                    line_best_r = (EpdRect){ gx, line_top, gw, line_h };
+                    if (cx < gx + gw) {
+                        matched_x = true;
+                        break;
+                    }
+                    gx += gw;
+                    cur += n;
+                }
+                (void)matched_x;
+
+                best_s = line_best_s;
+                best_e = line_best_e;
+                best_r = line_best_r;
+                have_best = true;
+                if (cy < line_bot) break;
+            }
+        }
+        used += line_h + extra;
+        off = next;
+    }
+
+    if (!have_best) return false;
+    if (out_start) *out_start = best_s;
+    if (out_end) *out_end = best_e;
+    if (out_glyph_rect) *out_glyph_rect = best_r;
+    return true;
+}
+
+size_t book_layout_span_underlines(
+    size_t page, EpdRect rect, size_t start_off, size_t end_off,
+    EpdRect* out_rects, size_t max_rects
+) {
+    if (!out_rects || !max_rects || end_off <= start_off || page >= book_layout_page_count() ||
+        rect.width != s_rect.width || rect.height != s_rect.height) {
+        return 0;
+    }
+    size_t off = s_pages[page];
+    size_t end = page + 1 < s_count ? s_pages[page + 1] : s_len;
+    if (end_off <= off || start_off >= end) return 0;
+
+    int64_t used = 0;
+    size_t count = 0;
+    while (off < end && count < max_rects) {
+        size_t next;
+        bool paragraph_end, heading;
+        int line_px;
+        if (!take_line(off, &next, &paragraph_end, &line_px, &heading)) break;
+        const blk_t* block = block_at(off);
+        int line_h = row_height(block, line_px);
+        if (used + line_h > rect.height) break;
+
+        if (!(block && (block->image || block->image_src))) {
+            size_t vis_end = line_visible_end(off, next);
+            size_t seg_s = start_off > off ? start_off : off;
+            size_t seg_e = end_off < vis_end ? end_off : vis_end;
+            if (seg_e > seg_s) {
+                int x0 = rect.x;
+                int x1 = rect.x;
+                int gx = rect.x;
+                size_t cur = off;
+                while (cur < vis_end) {
+                    size_t n = codepoint_size(s_text + cur, vis_end - cur);
+                    if (!n) break;
+                    char glyph[5];
+                    memcpy(glyph, s_text + cur, n);
+                    glyph[n] = 0;
+                    int gw = ttf_text_width_px(line_px, glyph);
+                    if (gw < 0) gw = 0;
+                    if (cur <= seg_s) x0 = gx;
+                    gx += gw;
+                    if (cur < seg_e) x1 = gx;
+                    cur += n;
+                }
+                if (x1 > x0) {
+                    // 下划线贴在字形基线下方 6px 处，厚度 3px，视觉接近 Figma underline。
+                    // Place a 3px underline 6px below the text baseline, matching Figma underline.
+                    int uy = rect.y + (int)used + ttf_ascender_px(line_px) + 6;
+                    if (uy + 3 > rect.y + (int)used + line_h) {
+                        uy = rect.y + (int)used + line_h - 3;
+                    }
+                    out_rects[count++] = (EpdRect){ x0, uy, x1 - x0, 3 };
+                }
+            }
+        }
+        used += line_h;
+        if (paragraph_end) used += line_h / (heading ? 2 : 3);
+        off = next;
+    }
+    return count;
+}
+
+void book_layout_draw_page_highlights(
+    uint8_t* fb, size_t page, EpdRect rect, int px,
+    const book_layout_span_t* spans, size_t span_count
+) {
+    book_layout_draw_page(fb, page, rect, px);
+    if (!fb || !spans || !span_count) return;
+    EpdRect bars[32];
+    for (size_t i = 0; i < span_count; ++i) {
+        size_t n = book_layout_span_underlines(
+            page, rect, spans[i].start_off, spans[i].end_off, bars, 32
+        );
+        for (size_t j = 0; j < n; ++j) {
+            for (int y = bars[j].y; y < bars[j].y + bars[j].height; ++y) {
+                for (int x = bars[j].x; x < bars[j].x + bars[j].width; ++x) {
+                    epd_draw_pixel(x, y, 0, fb);
+                }
+            }
+        }
+    }
+}

@@ -153,7 +153,9 @@ esp_err_t zip_open(const char* path, zip_reader_t** out) {
         uint16_t name_len = u16(h + 28), extra_len = u16(h + 30), comment_len = u16(h + 32);
         uint32_t record_len = 46U + (uint32_t)name_len + extra_len + comment_len;
         err = ESP_ERR_NOT_SUPPORTED;
-        if ((entry->flags & ~UINT16_C(0x080e)) || u16(h + 34) ||
+        // 允许位 1-2(deflate 级别)、位 3(数据描述符)、位 4(部分 EPUB 工具保留位)、位 11(UTF-8)；拒绝加密等特性。
+        // Allow bits 1-2 (deflate hints), 3 (data descriptor), 4 (reserved deflate bit used by some EPUB packers), 11 (UTF-8); reject encryption etc.
+        if ((entry->flags & ~UINT16_C(0x081e)) || u16(h + 34) ||
             (entry->method != 0 && entry->method != 8)) goto fail;
         err = ESP_ERR_INVALID_SIZE;
         if (entry->packed > ZIP_INPUT_MAX || entry->unpacked > ZIP_OUTPUT_MAX) goto fail;

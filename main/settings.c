@@ -25,6 +25,7 @@
 #define NVS_KEY_PICKUP "pickup"
 #define NVS_KEY_BOOK_PX "bk_px"
 #define NVS_KEY_BOOK_SHAKE "bk_shake"
+#define NVS_KEY_TZ_MIN "tz_min"
 #define FONT_PATH_MAX 160
 
 static app_sleep_mode_t s_sleep = APP_SLEEP_OFF;
@@ -34,6 +35,7 @@ static uint8_t s_last_boot;
 static bool s_pickup_wake;
 static uint8_t s_book_px = 48;
 static bool s_book_shake;
+static int16_t s_tz_offset_min = 480;
 
 static uint8_t valid_book_px(uint8_t px) {
     return px >= 36 && px <= 72 && (px - 36) % 4 == 0 ? px : 48;
@@ -69,6 +71,10 @@ void app_settings_init(void) {
     uint8_t book_px = 48, book_shake = 0;
     if (nvs_get_u8(h, NVS_KEY_BOOK_PX, &book_px) == ESP_OK) s_book_px = valid_book_px(book_px);
     if (nvs_get_u8(h, NVS_KEY_BOOK_SHAKE, &book_shake) == ESP_OK) s_book_shake = book_shake != 0;
+    int16_t tz_min = 480;
+    if (nvs_get_i16(h, NVS_KEY_TZ_MIN, &tz_min) == ESP_OK && tz_min >= -720 && tz_min <= 840) {
+        s_tz_offset_min = tz_min;
+    }
     nvs_close(h);
     ESP_LOGI(
         TAG, "sleep mode %s, font %s",
@@ -171,4 +177,19 @@ void app_settings_set_book_shake(bool on) {
     if (s_book_shake == on) return;
     s_book_shake = on;
     nvs_put_u8(NVS_KEY_BOOK_SHAKE, on ? 1 : 0);
+}
+
+int16_t app_settings_tz_offset_min(void) {
+    return s_tz_offset_min;
+}
+
+void app_settings_set_tz_offset_min(int16_t minutes) {
+    if (minutes < -720 || minutes > 840) minutes = 480;
+    if (s_tz_offset_min == minutes) return;
+    s_tz_offset_min = minutes;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i16(h, NVS_KEY_TZ_MIN, minutes);
+    nvs_commit(h);
+    nvs_close(h);
 }

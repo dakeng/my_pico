@@ -360,7 +360,8 @@ void app_loop_run(const app_loop_config_t* config) {
         if (pressed && err == ESP_OK) {
             held_key = -1;
             const int key = ui_key_hit_test(touch.x, touch.y);
-            const bool handle_hit = ui_menu_handle_hit_test(touch.x, touch.y);
+            const bool handle_hit = (menu_open || !current->no_menu_handle)
+                && ui_menu_handle_hit_test(touch.x, touch.y);
             ctx.consumed = true;
             if (key >= 0 || handle_hit) {
                 cancel_gesture(&ctx, current, &gesture);

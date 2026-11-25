@@ -39,3 +39,29 @@ size_t book_layout_page_for_offset(size_t off);
 /// 返回页首偏移；已完成页数索引是待排页起点（完成后为文本末尾），更大索引返回文本长度。
 /// Return a page start; index equal to completed count marks the pending page (EOF when complete), larger indexes return text length.
 size_t book_layout_page_start_offset(size_t page);
+
+typedef struct {
+    size_t start_off;  ///< 章节内起始字节偏移 / Start UTF-8 byte offset in chapter
+    size_t end_off;    ///< 章节内结束字节偏移（开区间） / Exclusive end UTF-8 byte offset in chapter
+} book_layout_span_t;
+
+/// 查找屏幕坐标 (x, y) 命中的 UTF-8 字符区间 [out_start, out_end) 及字形框；调用方持字体锁。
+/// Hit-test screen coords (x, y) to the UTF-8 glyph byte range [out_start, out_end) and optional rect; caller holds font lock.
+bool book_layout_char_at(
+    size_t page, EpdRect rect, int x, int y,
+    size_t* out_start, size_t* out_end, EpdRect* out_glyph_rect
+);
+
+/// 枚举页内与 [start_off, end_off) 重叠的每行下划线矩形（高 3px），返回写入数量。
+/// Enumerate per-line 3px underline rectangles on a page overlapping [start_off, end_off); returns count written.
+size_t book_layout_span_underlines(
+    size_t page, EpdRect rect, size_t start_off, size_t end_off,
+    EpdRect* out_rects, size_t max_rects
+);
+
+/// 绘制本页正文并叠加下划线列表；调用方持字体锁。
+/// Draw page text with highlight underline spans overlaid; caller holds font lock.
+void book_layout_draw_page_highlights(
+    uint8_t* fb, size_t page, EpdRect rect, int px,
+    const book_layout_span_t* spans, size_t span_count
+);

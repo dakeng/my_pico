@@ -630,3 +630,178 @@ esp_err_t book_epub_load_image(book_epub_t *book, size_t i, const char *referenc
 }
 uint32_t book_epub_total_bytes(const book_epub_t *book) { return book ? book->total : 0; }
 uint32_t book_epub_chapter_byte_offset(const book_epub_t *book, size_t i) { return book && i < book->count ? book->chapters[i].offset : 0; }
+
+/* ---- 书名、作者与封面轻量解析 / Lightweight title, author and cover parsing ---- */
+
+static void trim_trailing_spaces(char *s) {
+    size_t n = strlen(s);
+    while (n && s[n - 1] == ' ') s[--n] = 0;
+}
+
+static bool is_raster_image_media(const char *media) {
+    return !strcmp(media, "image/jpeg") || !strcmp(media, "image/jpg") || !strcmp(media, "image/png");
+}
+
+esp_err_t book_epub_read_meta(const char *path, book_epub_meta_t *out) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!path || !*path) return ESP_ERR_INVALID_ARG;
+
+    book_epub_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    esp_err_t err = zip_open(path, &tmp.zip);
+    if (err != ESP_OK) return err;
+
+    char opf[EPUB_PATH_CAP] = {0};
+    err = container_path(&tmp, opf);
+    if (err != ESP_OK) { zip_close(tmp.zip); return err; }
+
+    char *text = NULL;
+    size_t len = 0;
+    err = load_entry_limit(&tmp, zip_find(tmp.zip, opf), &text, &len, ZIP_OUTPUT_MAX);
+    if (err != ESP_OK) { zip_close(tmp.zip); return err; }
+
+    char cover_id[EPUB_ID_CAP] = {0};
+    char epub3_cover[EPUB_PATH_CAP] = {0};
+    char id_cover[EPUB_PATH_CAP] = {0};
+    char fallback_cover[EPUB_PATH_CAP] = {0};
+
+    xml_t xml;
+    xml_reader(&xml, text, len);
+    token_t t;
+    size_t meta_depth = 0, manifest_depth = 0;
+    size_t title_depth = 0, creator_depth = 0;
+    bool got_title = false, got_author = false;
+
+    while (xml_next(&xml, &t)) {
+        if (t.kind == XML_OPEN) {
+            if (!meta_depth && local_name(t.name, "metadata") && !t.empty) meta_depth = t.depth;
+            else if (!manifest_depth && local_name(t.name, "manifest") && !t.empty) manifest_depth = t.depth;
+            else if (meta_depth) {
+                if (!got_title && !title_depth && local_name(t.name, "title") && !t.empty) {
+                    title_depth = t.depth;
+                } else if (!got_author && !creator_depth && local_name(t.name, "creator") && !t.empty) {
+                    creator_depth = t.depth;
+                } else if (local_name(t.name, "meta") && !cover_id[0]) {
+                    char mname[64] = {0}, mcontent[EPUB_ID_CAP] = {0};
+                    if (attribute(t, "name", mname, sizeof(mname)) && !strcmp(mname, "cover")
+                        && attribute(t, "content", mcontent, sizeof(mcontent)) && mcontent[0]) {
+                        strcpy(cover_id, mcontent);
+                    }
+                }
+            } else if (manifest_depth && t.depth == manifest_depth + 1 && local_name(t.name, "item")) {
+                char id[EPUB_ID_CAP] = {0}, href[EPUB_PATH_CAP] = {0};
+                char media[80] = {0}, props[256] = {0}, resolved[EPUB_PATH_CAP] = {0};
+                if (attribute(t, "id", id, sizeof(id))
+                    && attribute(t, "href", href, sizeof(href))
+                    && attribute(t, "media-type", media, sizeof(media))
+                    && attribute(t, "properties", props, sizeof(props))
+                    && href[0] && is_raster_image_media(media)
+                    && resolve_path(opf, href, resolved)
+                    && zip_find(tmp.zip, resolved) >= 0) {
+                    if (!epub3_cover[0] && word(props, "cover-image")) {
+                        strcpy(epub3_cover, resolved);
+                    }
+                    if (!id_cover[0] && cover_id[0] && !strcmp(id, cover_id)) {
+                        strcpy(id_cover, resolved);
+                    }
+                    if (!fallback_cover[0] && (!strcmp(id, "cover") || !strcmp(id, "cover-image")
+                        || strstr(resolved, "cover") != NULL || strstr(resolved, "Cover") != NULL)) {
+                        strcpy(fallback_cover, resolved);
+                    }
+                }
+            }
+        } else if (t.kind == XML_TEXT) {
+            if (title_depth) (void)decode(t.text, out->title, sizeof(out->title), true, t.cdata);
+            if (creator_depth) (void)decode(t.text, out->author, sizeof(out->author), true, t.cdata);
+        } else if (t.kind == XML_CLOSE) {
+            if (t.depth == title_depth) {
+                title_depth = 0;
+                trim_trailing_spaces(out->title);
+                if (out->title[0]) got_title = true;
+            }
+            if (t.depth == creator_depth) {
+                creator_depth = 0;
+                trim_trailing_spaces(out->author);
+                if (out->author[0]) got_author = true;
+            }
+            if (t.depth == meta_depth) meta_depth = 0;
+            if (t.depth == manifest_depth) manifest_depth = 0;
+        }
+    }
+
+    const char *chosen = epub3_cover[0] ? epub3_cover : (id_cover[0] ? id_cover : fallback_cover);
+    if (chosen[0]) {
+        out->has_cover = true;
+        strcpy(out->cover_path, chosen);
+    }
+
+    free(text);
+    zip_close(tmp.zip);
+    return ESP_OK;
+}
+
+esp_err_t book_epub_load_cover_thumb(
+    const char *path, uint16_t target_w, uint16_t target_h, uint8_t **out_pixels
+) {
+    if (!out_pixels || !target_w || !target_h) return ESP_ERR_INVALID_ARG;
+    *out_pixels = NULL;
+
+    book_epub_meta_t meta;
+    esp_err_t err = book_epub_read_meta(path, &meta);
+    if (err != ESP_OK) return err;
+    if (!meta.has_cover || !meta.cover_path[0]) return ESP_ERR_NOT_FOUND;
+
+    book_epub_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    err = zip_open(path, &tmp.zip);
+    if (err != ESP_OK) return err;
+
+    char *raw = NULL;
+    size_t raw_len = 0;
+    err = load_entry(&tmp, zip_find(tmp.zip, meta.cover_path), &raw, &raw_len);
+    zip_close(tmp.zip);
+    if (err != ESP_OK) return err;
+
+    uint8_t *decoded = NULL;
+    uint16_t src_w = 0, src_h = 0;
+    bool ok = book_image_decode((const uint8_t *)raw, raw_len, 2u * 1024u * 1024u, &decoded, &src_w, &src_h);
+    free(raw);
+    if (!ok || !decoded || !src_w || !src_h) {
+        free(decoded);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint8_t *thumb = psram((size_t)target_w * target_h);
+    if (!thumb) {
+        free(decoded);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // 等比居中裁切（object-fit: cover），匹配 Figma 封面槽效果。
+    // Aspect-fill center crop (object-fit: cover) matching the Figma cover slot.
+    uint32_t crop_w = src_w, crop_h = src_h;
+    if ((uint64_t)src_w * target_h > (uint64_t)src_h * target_w) {
+        crop_w = (uint32_t)((uint64_t)src_h * target_w / target_h);
+        if (!crop_w) crop_w = 1;
+    } else {
+        crop_h = (uint32_t)((uint64_t)src_w * target_h / target_w);
+        if (!crop_h) crop_h = 1;
+    }
+    uint32_t ox = (src_w - crop_w) / 2;
+    uint32_t oy = (src_h - crop_h) / 2;
+
+    for (uint16_t y = 0; y < target_h; ++y) {
+        uint32_t sy = oy + (uint32_t)((uint64_t)y * crop_h / target_h);
+        if (sy >= src_h) sy = src_h - 1;
+        for (uint16_t x = 0; x < target_w; ++x) {
+            uint32_t sx = ox + (uint32_t)((uint64_t)x * crop_w / target_w);
+            if (sx >= src_w) sx = src_w - 1;
+            thumb[(size_t)y * target_w + x] = decoded[(size_t)sy * src_w + sx];
+        }
+    }
+
+    free(decoded);
+    *out_pixels = thumb;
+    return ESP_OK;
+}

@@ -3,6 +3,7 @@ set(main_requires
     read_pico_transfer
     read_pico_search
     espressif__qrcode
+    espressif__cjson
     continuous_du
     e0470_epaper_waveform
     read_pico_pmu
@@ -17,6 +18,11 @@ set(main_requires
     esp_driver_gpio
     esp_driver_usb_serial_jtag
     esp_app_format
+    esp_wifi
+    esp_netif
+    esp_event
+    esp_http_server
+    lwip
 )
 idf_component_register(
     SRCS
@@ -31,6 +37,10 @@ idf_component_register(
         "ui/ui_wifi_qr.c"
         "ui/datamatrix.c"
         "ui/ui_menu.c"
+        "ui/ui_statusbar.c"
+        "apps/app_launcher.c"
+        "apps/app_mypico_shelf.c"
+        "apps/app_mypico_reader.c"
         "apps/app_home.c"
         "apps/app_refresh.c"
         "apps/app_reading.c"
@@ -38,6 +48,7 @@ idf_component_register(
         "apps/app_transfer.c"
         "book/book_store.c"
         "book/book_progress.c"
+        "book/book_data.c"
         "book/book_source.c"
         "book/book_txt.c"
         "book/book_epub.c"
@@ -47,6 +58,8 @@ idf_component_register(
         "book/html_text.c"
         "book/book_layout.c"
         "book/gbk.c"
+        "sync/mypico_mdns.c"
+        "sync/mypico_sync.c"
         "apps/app_touch.c"
         "apps/app_axis.c"
         "apps/app_power.c"
@@ -61,7 +74,7 @@ idf_component_register(
         "factory/pmu_selftest.c"
         "factory/vcom_setup.c"
     REQUIRES ${main_requires}
-    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book"
+    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book" "sync"
     EMBED_FILES
         "assets/lock_4bpp.bin"
         "assets/loading_4bpp.bin"

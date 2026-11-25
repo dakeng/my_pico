@@ -45,3 +45,7 @@ void app_settings_set_book_px(uint8_t px);
 bool app_settings_book_shake(void);
 /// 保存实验性晃动翻页开关。/ Persist the experimental shake page-turn switch.
 void app_settings_set_book_shake(bool on);
+/// 本地时区偏移（分钟），默认 +480（UTC+8）。/ Local timezone offset in minutes, defaulting to +480 (UTC+8).
+int16_t app_settings_tz_offset_min(void);
+/// 保存本地时区偏移（-720..+840）。/ Persist local timezone offset (-720..+840).
+void app_settings_set_tz_offset_min(int16_t minutes);
