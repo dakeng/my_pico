@@ -34,6 +34,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mypico_sync.h"
 #include "read_pico_board.h"
 #include "read_pico_pmu.h"
 #include "read_pico_sd.h"
@@ -53,6 +54,7 @@
 // Retry the saved SD font shortly after a card appears or mounts.
 #define FONT_RETRY_INTERVAL_MS 3000
 #define MEDIA_POLL_INTERVAL_MS 500
+#define WIFI_POLL_INTERVAL_MS 2000
 
 static int64_t s_lock_ignore_until_ms;
 
@@ -295,6 +297,7 @@ void app_loop_run(const app_loop_config_t* config) {
     int64_t last_input_ms = esp_timer_get_time() / 1000;
     int64_t last_font_retry_ms = 0;
     int64_t last_media_poll_ms = 0;
+    int64_t last_wifi_poll_ms = 0;
     bool media_mounted = ttf_font_ready() && !ttf_font_is_builtin();
     bool media_invalidated = false;
     app_lock_ignore_for(APP_LOCK_IGNORE_BOOT_MS);
@@ -467,14 +470,23 @@ void app_loop_run(const app_loop_config_t* config) {
                 }
             } else if (ctx.now_ms >= s_lock_ignore_until_ms
                        && ctx.now_ms - last_input_ms >= APP_AUTO_SLEEP_MS) {
-                ESP_LOGI(TAG, "idle lock");
-                lock_and_resume(
-                    &ctx, current, &gesture, &held_key, &menu_pressed, &feedback,
-                    menu_open, menu_leaf, &media_mounted, &media_invalidated,
-                    &last_media_poll_ms
-                );
-                last_input_ms = ctx.now_ms;
+                if (app_sleep_keep_awake_active()) {
+                    last_input_ms = ctx.now_ms;
+                } else {
+                    ESP_LOGI(TAG, "idle lock");
+                    lock_and_resume(
+                        &ctx, current, &gesture, &held_key, &menu_pressed, &feedback,
+                        menu_open, menu_leaf, &media_mounted, &media_invalidated,
+                        &last_media_poll_ms
+                    );
+                    last_input_ms = ctx.now_ms;
+                }
             }
+        }
+
+        if (!current->holds_pmu && ctx.now_ms - last_wifi_poll_ms >= WIFI_POLL_INTERVAL_MS) {
+            last_wifi_poll_ms = ctx.now_ms;
+            mypico_wifi_tick(ctx.now_ms);
         }
 
         // 设置里存的字体在 SD 卡上，开机时卡可能还没挂好，这里定期重试。

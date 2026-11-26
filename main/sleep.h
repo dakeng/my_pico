@@ -34,6 +34,12 @@ void app_sleep_bind(cst836u_handle_t tp, sc7a20h_handle_t acc);
 /// 当前锁屏设置是否走软睡/关机。
 /// Whether the stored lock choice powers the host down (soft sleep or off).
 bool app_lock_powers_down(void);
+/// 当前是否正在充电（含充饱在位）或已连接 USB 数据线。
+/// Returns true if currently charging (including full-inferred) or connected to a USB data host.
+bool app_sleep_is_usb_or_charging(void);
+/// 开启「充电/USB 不休眠」且当前正在充电或已连 USB 数据线时返回 true。
+/// Returns true when keep-awake-on-USB/charging is enabled and charging or USB host is active.
+bool app_sleep_keep_awake_active(void);
 
 void enter_lock_and_sleep(
     EpdiyHighlevelState* hl, int64_t* ignore_until_ms, sc7a20h_handle_t acc

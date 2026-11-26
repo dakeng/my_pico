@@ -13,12 +13,14 @@
 #include "app.h"
 #include "display.h"
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_private/sleep_cpu.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mypico_sync.h"
 #include "pmu_selftest.h"
 #include "read_pico_board.h"
 #include "read_pico_buzzer.h"
@@ -50,6 +52,24 @@ void app_sleep_bind(cst836u_handle_t tp, sc7a20h_handle_t acc) {
 
 bool app_lock_powers_down(void) {
     return app_settings_sleep_mode() != APP_SLEEP_LIGHT;
+}
+
+bool app_sleep_is_usb_or_charging(void) {
+    // 先查 ESP32-S3 USB-Serial/JTAG SOF 连接状态，连电脑数据线（即便电量已满）立即免 I2C 返回。
+    // Check ESP32-S3 USB-Serial/JTAG SOF host connection first (zero I2C; covers full battery on data cable).
+    if (usb_serial_jtag_is_connected()) return true;
+    if (!read_pico_pmu_ready()) return false;
+    (void)read_pico_pmu_poll();
+    const pmu_snapshot_t* pmu = read_pico_pmu_get();
+    if (!pmu || !pmu->status_ok) return false;
+    return pmu->charge_state == PMU_CHARGE_CHARGING
+        || pmu->charge_state == PMU_CHARGE_FULL_INFERRED
+        || (pmu->flags & PMU_STATUS_CHARGING_ACTIVE) != 0;
+}
+
+bool app_sleep_keep_awake_active(void) {
+    if (!app_settings_keep_awake_usb()) return false;
+    return app_sleep_is_usb_or_charging();
 }
 
 // 触摸、加速度计都在常开 3V3 上，ESP 浅睡或 EN 拉低都不会断它们的电，必须主动送进最低功耗态。
@@ -287,6 +307,9 @@ void enter_lock_and_sleep(
     // 乐曲的 32 kHz 采样中断和线圈电流会干扰锁屏整屏刷新，先停再上屏轨。
     // The score's 32 kHz sample ISR and coil current disturb the lock-face full refresh; stop it before the rails come up.
     if (read_pico_buzzer_score_busy()) (void)read_pico_buzzer_score_stop();
+    // 锁屏/休眠前先停常驻 Wi-Fi，避免浅睡射频耗电或下电残留状态。
+    // Stop persistent Wi-Fi before lock/sleep so light sleep stays low-power and power-down exits cleanly.
+    mypico_wifi_suspend(true);
     uint8_t* framebuffer = epd_hl_get_framebuffer(hl);
     epd_poweron();
     epd_clear();
@@ -313,6 +336,7 @@ void enter_lock_and_sleep(
     epd_clear();
     epd_hl_set_all_white(hl);
     read_pico_pmu_drain_events();
+    mypico_wifi_suspend(false);
     if (ignore_until_ms) {
         *ignore_until_ms = esp_timer_get_time() / 1000 + APP_LOCK_IGNORE_BOOT_MS;
     }

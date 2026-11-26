@@ -26,6 +26,16 @@
 #define NVS_KEY_BOOK_PX "bk_px"
 #define NVS_KEY_BOOK_SHAKE "bk_shake"
 #define NVS_KEY_TZ_MIN "tz_min"
+#define NVS_KEY_AWAKE_USB "awake_usb"
+#define NVS_KEY_KEEP_WIFI "keep_wifi"
+#define NVS_KEY_WIFI_USB "wifi_usb"
+#define NVS_KEY_RD_LINE "rd_line"
+#define NVS_KEY_RD_MARGIN "rd_margin"
+#define NVS_KEY_RD_PARA "rd_para"
+#define NVS_KEY_RD_INDENT "rd_indent"
+#define NVS_KEY_RD_ALIGN "rd_align"
+#define NVS_KEY_RD_IMG "rd_img"
+#define NVS_KEY_RD_STYLE "rd_style"
 #define FONT_PATH_MAX 160
 
 static app_sleep_mode_t s_sleep = APP_SLEEP_OFF;
@@ -36,9 +46,19 @@ static bool s_pickup_wake;
 static uint8_t s_book_px = 48;
 static bool s_book_shake;
 static int16_t s_tz_offset_min = 480;
+static bool s_keep_awake_usb = true;
+static bool s_keep_wifi = true;
+static bool s_keep_wifi_usb_only = true;
+static uint8_t s_rd_line = 50;
+static uint8_t s_rd_margin = 40;
+static uint8_t s_rd_para = 35;
+static bool s_rd_indent = true;
+static uint8_t s_rd_align = 0;
+static uint8_t s_rd_img = 0;
+static bool s_rd_style = true;
 
 static uint8_t valid_book_px(uint8_t px) {
-    return px >= 36 && px <= 72 && (px - 36) % 4 == 0 ? px : 48;
+    return px >= 32 && px <= 72 && (px - 32) % 4 == 0 ? px : 48;
 }
 
 void app_settings_init(void) {
@@ -75,6 +95,26 @@ void app_settings_init(void) {
     if (nvs_get_i16(h, NVS_KEY_TZ_MIN, &tz_min) == ESP_OK && tz_min >= -720 && tz_min <= 840) {
         s_tz_offset_min = tz_min;
     }
+    uint8_t awake_usb = 1;
+    if (nvs_get_u8(h, NVS_KEY_AWAKE_USB, &awake_usb) == ESP_OK) {
+        s_keep_awake_usb = awake_usb != 0;
+    }
+    uint8_t keep_wifi = 1;
+    if (nvs_get_u8(h, NVS_KEY_KEEP_WIFI, &keep_wifi) == ESP_OK) {
+        s_keep_wifi = keep_wifi != 0;
+    }
+    uint8_t wifi_usb = 1;
+    if (nvs_get_u8(h, NVS_KEY_WIFI_USB, &wifi_usb) == ESP_OK) {
+        s_keep_wifi_usb_only = wifi_usb != 0;
+    }
+    uint8_t v = 0;
+    if (nvs_get_u8(h, NVS_KEY_RD_LINE, &v) == ESP_OK && v >= 20 && v <= 120) s_rd_line = v;
+    if (nvs_get_u8(h, NVS_KEY_RD_MARGIN, &v) == ESP_OK && v >= 16 && v <= 80) s_rd_margin = v;
+    if (nvs_get_u8(h, NVS_KEY_RD_PARA, &v) == ESP_OK && v <= 120) s_rd_para = v;
+    if (nvs_get_u8(h, NVS_KEY_RD_INDENT, &v) == ESP_OK) s_rd_indent = v != 0;
+    if (nvs_get_u8(h, NVS_KEY_RD_ALIGN, &v) == ESP_OK && v <= 1) s_rd_align = v;
+    if (nvs_get_u8(h, NVS_KEY_RD_IMG, &v) == ESP_OK && v <= 2) s_rd_img = v;
+    if (nvs_get_u8(h, NVS_KEY_RD_STYLE, &v) == ESP_OK) s_rd_style = v != 0;
     nvs_close(h);
     ESP_LOGI(
         TAG, "sleep mode %s, font %s",
@@ -192,4 +232,109 @@ void app_settings_set_tz_offset_min(int16_t minutes) {
     nvs_set_i16(h, NVS_KEY_TZ_MIN, minutes);
     nvs_commit(h);
     nvs_close(h);
+}
+
+bool app_settings_keep_awake_usb(void) {
+    return s_keep_awake_usb;
+}
+
+void app_settings_set_keep_awake_usb(bool on) {
+    if (s_keep_awake_usb == on) return;
+    s_keep_awake_usb = on;
+    nvs_put_u8(NVS_KEY_AWAKE_USB, on ? 1 : 0);
+}
+
+bool app_settings_keep_wifi(void) {
+    return s_keep_wifi;
+}
+
+void app_settings_set_keep_wifi(bool on) {
+    if (s_keep_wifi == on) return;
+    s_keep_wifi = on;
+    nvs_put_u8(NVS_KEY_KEEP_WIFI, on ? 1 : 0);
+}
+
+bool app_settings_keep_wifi_usb_only(void) {
+    return s_keep_wifi_usb_only;
+}
+
+void app_settings_set_keep_wifi_usb_only(bool on) {
+    if (s_keep_wifi_usb_only == on) return;
+    s_keep_wifi_usb_only = on;
+    nvs_put_u8(NVS_KEY_WIFI_USB, on ? 1 : 0);
+}
+
+uint8_t app_settings_reader_line_pct(void) {
+    return s_rd_line;
+}
+
+void app_settings_set_reader_line_pct(uint8_t pct) {
+    if (pct < 20 || pct > 120) pct = 50;
+    if (s_rd_line == pct) return;
+    s_rd_line = pct;
+    nvs_put_u8(NVS_KEY_RD_LINE, pct);
+}
+
+uint8_t app_settings_reader_margin(void) {
+    return s_rd_margin;
+}
+
+void app_settings_set_reader_margin(uint8_t margin_px) {
+    if (margin_px < 16 || margin_px > 80) margin_px = 40;
+    if (s_rd_margin == margin_px) return;
+    s_rd_margin = margin_px;
+    nvs_put_u8(NVS_KEY_RD_MARGIN, margin_px);
+}
+
+uint8_t app_settings_reader_para_pct(void) {
+    return s_rd_para;
+}
+
+void app_settings_set_reader_para_pct(uint8_t pct) {
+    if (pct > 120) pct = 35;
+    if (s_rd_para == pct) return;
+    s_rd_para = pct;
+    nvs_put_u8(NVS_KEY_RD_PARA, pct);
+}
+
+bool app_settings_reader_indent(void) {
+    return s_rd_indent;
+}
+
+void app_settings_set_reader_indent(bool on) {
+    if (s_rd_indent == on) return;
+    s_rd_indent = on;
+    nvs_put_u8(NVS_KEY_RD_INDENT, on ? 1 : 0);
+}
+
+uint8_t app_settings_reader_align(void) {
+    return s_rd_align;
+}
+
+void app_settings_set_reader_align(uint8_t align) {
+    if (align > 1) align = 0;
+    if (s_rd_align == align) return;
+    s_rd_align = align;
+    nvs_put_u8(NVS_KEY_RD_ALIGN, align);
+}
+
+uint8_t app_settings_reader_img_mode(void) {
+    return s_rd_img;
+}
+
+void app_settings_set_reader_img_mode(uint8_t mode) {
+    if (mode > 2) mode = 0;
+    if (s_rd_img == mode) return;
+    s_rd_img = mode;
+    nvs_put_u8(NVS_KEY_RD_IMG, mode);
+}
+
+bool app_settings_reader_epub_style(void) {
+    return s_rd_style;
+}
+
+void app_settings_set_reader_epub_style(bool on) {
+    if (s_rd_style == on) return;
+    s_rd_style = on;
+    nvs_put_u8(NVS_KEY_RD_STYLE, on ? 1 : 0);
 }

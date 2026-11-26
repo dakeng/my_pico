@@ -122,16 +122,21 @@ esp_err_t mypico_sync_build_json_payload(
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mypico_mdns.h"
 #include "nvs.h"
+#include "settings.h"
+#include "sleep.h"
 #include "ui_statusbar.h"
 
 #define TAG "mypico_sync"
 #define SYNC_CONNECT_TIMEOUT_MS 20000
+#define SNTP_SYNC_TIMEOUT_MS 15000
+#define WIFI_BG_BACKOFF_MS 60000
 #define SYNC_MAX_RETRIES 4
 
 // 与 read_pico_transfer 的 NVS 凭据布局保持完全一致，复用同一套热点配网。
@@ -148,7 +153,25 @@ static book_record_t s_book;
 static int16_t s_tz_min = 480;
 static int64_t s_started_ms;
 static int s_retries;
-static bool s_active;
+static bool s_sync_active;
+static bool s_sntp_active;
+static bool s_bg_active;
+static bool s_wifi_yielded;
+static bool s_wifi_suspended;
+static bool s_sta_connected;
+static char s_sta_ssid[33];
+static char s_sta_ip[20];
+static uint32_t s_sta_ip_addr;
+static int64_t s_bg_backoff_until_ms;
+static bool s_bg_need_teardown;
+static bool s_boot_sntp_done;
+static bool s_bg_sntp_running;
+static int64_t s_bg_sntp_ms;
+static uint32_t s_bg_sntp_got_unix;
+static mypico_sntp_status_t s_sntp;
+static int64_t s_sntp_sync_ms;
+static uint32_t s_sntp_got_unix;
+static bool s_sntp_need_teardown;
 static bool s_wifi_started;
 static bool s_wifi_inited;
 static esp_netif_t* s_netif;
@@ -353,58 +376,149 @@ static esp_err_t start_http_server(void) {
     return ESP_OK;
 }
 
+static void on_sntp_synced(struct timeval* tv) {
+    if (!tv || tv->tv_sec < (time_t)MYPICO_TIME_VALID_MIN) return;
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_sntp_active && s_sntp.state == MYPICO_SNTP_SYNCING) {
+        s_sntp_got_unix = (uint32_t)tv->tv_sec;
+    } else if (s_bg_sntp_running) {
+        s_bg_sntp_got_unix = (uint32_t)tv->tv_sec;
+    }
+    xSemaphoreGive(s_lock);
+}
+
+static void start_sntp_client(void) {
+    if (esp_sntp_enabled()) esp_sntp_stop();
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 1
+    esp_sntp_setservername(1, "ntp.tencent.com");
+#endif
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 2
+    esp_sntp_setservername(2, "pool.ntp.org");
+#endif
+    esp_sntp_set_time_sync_notification_cb(on_sntp_synced);
+    esp_sntp_init();
+}
+
 static void on_wifi_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
     (void)arg;
     (void)base;
     (void)data;
-    if (!s_active) return;
+    if (!s_wifi_started) return;
     if (id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        if (s_status.state == MYPICO_SYNC_CONNECTING && s_retries < SYNC_MAX_RETRIES) {
-            s_retries++;
-            xSemaphoreGive(s_lock);
-            esp_wifi_connect();
-        } else {
-            if (s_status.state != MYPICO_SYNC_DONE) {
-                s_status.state = MYPICO_SYNC_ERROR;
-                snprintf(
-                    s_status.message, sizeof(s_status.message),
-                    "无法连上热点，请确认手机热点已开且启用「最大兼容性」。"
-                );
+        s_sta_connected = false;
+        s_sta_ip[0] = 0;
+        s_sta_ip_addr = 0;
+
+        if (s_sntp_active) {
+            if (s_sntp.state == MYPICO_SNTP_CONNECTING && s_retries < SYNC_MAX_RETRIES) {
+                s_retries++;
+                xSemaphoreGive(s_lock);
+                esp_wifi_connect();
+            } else {
+                if (s_sntp.state != MYPICO_SNTP_DONE) {
+                    s_sntp.state = MYPICO_SNTP_ERROR;
+                    snprintf(
+                        s_sntp.message, sizeof(s_sntp.message),
+                        "无法连接 Wi-Fi，请确认热点或路由器已开启。"
+                    );
+                    s_sntp_need_teardown = true;
+                }
+                xSemaphoreGive(s_lock);
             }
-            xSemaphoreGive(s_lock);
+            return;
         }
+        if (s_sync_active) {
+            if (s_status.state == MYPICO_SYNC_CONNECTING && s_retries < SYNC_MAX_RETRIES) {
+                s_retries++;
+                xSemaphoreGive(s_lock);
+                esp_wifi_connect();
+            } else {
+                if (s_status.state != MYPICO_SYNC_DONE) {
+                    s_status.state = MYPICO_SYNC_ERROR;
+                    snprintf(
+                        s_status.message, sizeof(s_status.message),
+                        "无法连上热点，请确认手机热点已开且启用「最大兼容性」。"
+                    );
+                }
+                xSemaphoreGive(s_lock);
+            }
+            return;
+        }
+        if (s_bg_active) {
+            if (s_retries < 3) {
+                s_retries++;
+                xSemaphoreGive(s_lock);
+                esp_wifi_connect();
+            } else {
+                // 搜不到已保存 Wi-Fi 时自动停止重连并进入退避，避免外出持续扫描耗电。
+                // Stop scanning and back off when the saved AP is unreachable to avoid draining battery.
+                s_bg_need_teardown = true;
+                xSemaphoreGive(s_lock);
+            }
+            return;
+        }
+        xSemaphoreGive(s_lock);
     }
 }
 
 static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
     (void)arg;
     (void)base;
-    if (!s_active || id != IP_EVENT_STA_GOT_IP) return;
+    if (!s_wifi_started || id != IP_EVENT_STA_GOT_IP) return;
     ip_event_got_ip_t* ev = (ip_event_got_ip_t*)data;
     if (ev->esp_netif != s_netif) return;
 
     char ip_str[20];
     snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ev->ip_info.ip));
-    ESP_LOGI(TAG, "Connected to hotspot, IP=%s", ip_str);
-
-    esp_err_t http_err = start_http_server();
-    if (http_err == ESP_OK) {
-        (void)mypico_mdns_start(MYPICO_SYNC_HOSTNAME, ev->ip_info.ip.addr);
-    }
+    ESP_LOGI(TAG, "Connected to Wi-Fi, IP=%s", ip_str);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    strcpy(s_status.ip, ip_str);
-    if (http_err == ESP_OK) {
-        s_status.state = MYPICO_SYNC_READY;
-        snprintf(s_status.message, sizeof(s_status.message), "热点已连接，现在点击 iPhone 快捷指令即可拉取。");
-    } else {
-        s_status.state = MYPICO_SYNC_ERROR;
-        snprintf(s_status.message, sizeof(s_status.message), "同步服务启动失败。");
+    s_sta_connected = true;
+    s_retries = 0;
+    strcpy(s_sta_ip, ip_str);
+    s_sta_ip_addr = ev->ip_info.ip.addr;
+    bool for_sntp = s_sntp_active;
+    bool for_sync = s_sync_active;
+    bool need_boot_sntp = !for_sntp && !for_sync && s_bg_active && !s_boot_sntp_done && !s_bg_sntp_running;
+    if (for_sntp) {
+        s_sntp.state = MYPICO_SNTP_SYNCING;
+        s_sntp_sync_ms = esp_timer_get_time() / 1000;
+        snprintf(s_sntp.message, sizeof(s_sntp.message), "已联网 (%s)，正在向 NTP 对时…", ip_str);
+    } else if (need_boot_sntp) {
+        s_bg_sntp_running = true;
+        s_bg_sntp_ms = esp_timer_get_time() / 1000;
+        s_bg_sntp_got_unix = 0;
     }
     xSemaphoreGive(s_lock);
+
+    if (for_sntp || need_boot_sntp) {
+        start_sntp_client();
+        return;
+    }
+
+    if (for_sync) {
+        esp_err_t http_err = start_http_server();
+        if (http_err == ESP_OK) {
+            (void)mypico_mdns_start(MYPICO_SYNC_HOSTNAME, ev->ip_info.ip.addr);
+        }
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        strcpy(s_status.ip, ip_str);
+        if (http_err == ESP_OK) {
+            s_status.state = MYPICO_SYNC_READY;
+            snprintf(s_status.message, sizeof(s_status.message), "热点已连接，现在点击 iPhone 快捷指令即可拉取。");
+        } else {
+            s_status.state = MYPICO_SYNC_ERROR;
+            snprintf(s_status.message, sizeof(s_status.message), "同步服务启动失败。");
+        }
+        xSemaphoreGive(s_lock);
+    }
 }
 
 static esp_err_t clone_book_record(const book_record_t* src, book_record_t* dst) {
@@ -421,6 +535,110 @@ static esp_err_t clone_book_record(const book_record_t* src, book_record_t* dst)
         memcpy(dst->highlights, src->highlights, bytes);
     }
     return ESP_OK;
+}
+
+static bool should_keep_wifi_now(void) {
+    if (s_wifi_yielded || s_wifi_suspended) return false;
+    if (!app_settings_keep_wifi()) return false;
+    if (app_settings_keep_wifi_usb_only()) return app_sleep_is_usb_or_charging();
+    return true;
+}
+
+static esp_err_t start_sta_wifi(const saved_wifi_cred_t* cred, wifi_ps_type_t ps_mode) {
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+
+    s_netif = esp_netif_create_default_wifi_sta();
+    if (!s_netif) return ESP_ERR_NO_MEM;
+    (void)esp_netif_set_hostname(s_netif, "mypico");
+
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&wcfg);
+    if (err != ESP_OK) return err;
+    s_wifi_inited = true;
+
+    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, &s_wifi_ev);
+    if (err != ESP_OK) return err;
+    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip_event, NULL, &s_ip_ev);
+    if (err != ESP_OK) return err;
+
+    wifi_config_t sta = {0};
+    size_t ssid_len = strlen(cred->ssid);
+    if (ssid_len > sizeof(sta.sta.ssid)) ssid_len = sizeof(sta.sta.ssid);
+    size_t pass_len = strlen(cred->password);
+    if (pass_len > sizeof(sta.sta.password)) pass_len = sizeof(sta.sta.password);
+    memcpy(sta.sta.ssid, cred->ssid, ssid_len);
+    memcpy(sta.sta.password, cred->password, pass_len);
+    sta.sta.threshold.authmode = pass_len ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    sta.sta.pmf_cfg.capable = true;
+    sta.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    sta.sta.listen_interval = 5;
+
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err == ESP_OK) err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, &sta);
+    memset(&sta, 0, sizeof(sta));
+    if (err == ESP_OK) err = esp_wifi_set_ps(ps_mode);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        snprintf(s_sta_ssid, sizeof(s_sta_ssid), "%s", cred->ssid);
+        s_sta_connected = false;
+        s_sta_ip[0] = 0;
+        s_sta_ip_addr = 0;
+        s_wifi_started = true;
+        xSemaphoreGive(s_lock);
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        s_wifi_started = false;
+        return err;
+    }
+    return ESP_OK;
+}
+
+static void stop_sta_wifi(void) {
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
+    }
+    mypico_mdns_stop();
+
+    if (s_http) {
+        httpd_stop(s_http);
+        s_http = NULL;
+    }
+    if (s_wifi_ev) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_ev);
+        s_wifi_ev = NULL;
+    }
+    if (s_ip_ev) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_ip_ev);
+        s_ip_ev = NULL;
+    }
+    if (s_wifi_started) {
+        s_wifi_started = false;
+        (void)esp_wifi_disconnect();
+        (void)esp_wifi_stop();
+    }
+    if (s_wifi_inited) {
+        (void)esp_wifi_deinit();
+        s_wifi_inited = false;
+    }
+    if (s_netif) {
+        esp_netif_destroy_default_wifi(s_netif);
+        s_netif = NULL;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_sta_connected = false;
+    s_sta_ssid[0] = 0;
+    s_sta_ip[0] = 0;
+    s_sta_ip_addr = 0;
+    s_bg_active = false;
+    s_bg_need_teardown = false;
+    s_bg_sntp_running = false;
+    s_bg_sntp_got_unix = 0;
+    xSemaphoreGive(s_lock);
 }
 
 esp_err_t mypico_sync_start(const book_record_t* rec, int16_t tz_offset_min) {
@@ -449,59 +667,57 @@ esp_err_t mypico_sync_start(const book_record_t* rec, int16_t tz_offset_min) {
         return ESP_ERR_NOT_FOUND;
     }
 
+    // 若常驻 Wi-Fi 已连在同一个 SSID 上，直接复用连接，免重连秒开同步服务。
+    // Reuse an already-connected persistent STA link on the same SSID for instant sync start.
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool reuse = s_wifi_started && s_sta_connected && strcmp(s_sta_ssid, cred.ssid) == 0 && s_sta_ip_addr != 0;
+    char reuse_ip[20] = {0};
+    uint32_t reuse_addr = s_sta_ip_addr;
+    if (reuse) strcpy(reuse_ip, s_sta_ip);
     snprintf(s_status.ssid, sizeof(s_status.ssid), "%s", cred.ssid);
-    s_status.state = MYPICO_SYNC_CONNECTING;
-    snprintf(s_status.message, sizeof(s_status.message), "正在连接 %s…", cred.ssid);
+    s_sync_active = true;
+    s_sntp_active = false;
+    s_bg_active = false;
     s_started_ms = esp_timer_get_time() / 1000;
     s_retries = 0;
-    s_active = true;
     xSemaphoreGive(s_lock);
 
-    esp_err_t err = esp_netif_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) goto fail;
-    err = esp_event_loop_create_default();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) goto fail;
+    if (reuse) {
+        memset(&cred, 0, sizeof(cred));
+        (void)esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_err_t http_err = start_http_server();
+        if (http_err == ESP_OK) {
+            (void)mypico_mdns_start(MYPICO_SYNC_HOSTNAME, reuse_addr);
+        }
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        strcpy(s_status.ip, reuse_ip);
+        if (http_err == ESP_OK) {
+            s_status.state = MYPICO_SYNC_READY;
+            snprintf(s_status.message, sizeof(s_status.message), "已复用 Wi-Fi，现在点击 iPhone 快捷指令即可拉取。");
+        } else {
+            s_status.state = MYPICO_SYNC_ERROR;
+            snprintf(s_status.message, sizeof(s_status.message), "同步服务启动失败。");
+        }
+        xSemaphoreGive(s_lock);
+        return http_err;
+    }
 
-    s_netif = esp_netif_create_default_wifi_sta();
-    if (!s_netif) { err = ESP_ERR_NO_MEM; goto fail; }
-    (void)esp_netif_set_hostname(s_netif, "mypico");
-
-    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
-    err = esp_wifi_init(&wcfg);
-    if (err != ESP_OK) goto fail;
-    s_wifi_inited = true;
-
-    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, &s_wifi_ev);
-    if (err != ESP_OK) goto fail;
-    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_ip_event, NULL, &s_ip_ev);
-    if (err != ESP_OK) goto fail;
-
-    wifi_config_t sta = {0};
-    size_t ssid_len = strlen(cred.ssid);
-    if (ssid_len > sizeof(sta.sta.ssid)) ssid_len = sizeof(sta.sta.ssid);
-    size_t pass_len = strlen(cred.password);
-    if (pass_len > sizeof(sta.sta.password)) pass_len = sizeof(sta.sta.password);
-    memcpy(sta.sta.ssid, cred.ssid, ssid_len);
-    memcpy(sta.sta.password, cred.password, pass_len);
-    sta.sta.threshold.authmode = pass_len ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    sta.sta.pmf_cfg.capable = true;
-    sta.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
-    memset(&cred, 0, sizeof(cred));
-
-    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (err == ESP_OK) err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, &sta);
-    memset(&sta, 0, sizeof(sta));
-    if (err == ESP_OK) err = esp_wifi_start();
-    if (err != ESP_OK) goto fail;
-    s_wifi_started = true;
-    return ESP_OK;
-
-fail:
-    memset(&cred, 0, sizeof(cred));
-    mypico_sync_stop();
+    if (s_wifi_started || s_wifi_inited) {
+        stop_sta_wifi();
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_sync_active = true;
+    s_status.state = MYPICO_SYNC_CONNECTING;
+    snprintf(s_status.message, sizeof(s_status.message), "正在连接 %s…", cred.ssid);
+    xSemaphoreGive(s_lock);
+
+    esp_err_t err = start_sta_wifi(&cred, WIFI_PS_NONE);
+    memset(&cred, 0, sizeof(cred));
+    if (err == ESP_OK) return ESP_OK;
+
+    stop_sta_wifi();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_sync_active = false;
     s_status.state = MYPICO_SYNC_ERROR;
     snprintf(s_status.message, sizeof(s_status.message), "Wi-Fi 初始化失败 (%s)", esp_err_to_name(err));
     xSemaphoreGive(s_lock);
@@ -510,41 +726,28 @@ fail:
 
 void mypico_sync_stop(void) {
     ensure_lock();
-    s_active = false;
     mypico_mdns_stop();
-
     if (s_http) {
         httpd_stop(s_http);
         s_http = NULL;
     }
-    if (s_wifi_ev) {
-        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_ev);
-        s_wifi_ev = NULL;
-    }
-    if (s_ip_ev) {
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_ip_ev);
-        s_ip_ev = NULL;
-    }
-    if (s_wifi_started) {
-        (void)esp_wifi_disconnect();
-        (void)esp_wifi_stop();
-        s_wifi_started = false;
-    }
-    if (s_wifi_inited) {
-        (void)esp_wifi_deinit();
-        s_wifi_inited = false;
-    }
-    if (s_netif) {
-        esp_netif_destroy_default_wifi(s_netif);
-        s_netif = NULL;
-    }
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_sync_active = false;
     book_data_record_free(&s_book);
+    bool keep = should_keep_wifi_now() && s_wifi_started && s_sta_connected;
+    if (keep) s_bg_active = true;
     xSemaphoreGive(s_lock);
+
+    if (keep) {
+        (void)esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    } else if (!s_sntp_active) {
+        stop_sta_wifi();
+    }
 }
 
 void mypico_sync_poll(int64_t now_ms) {
-    if (!s_active || !s_lock) return;
+    if (!s_sync_active || !s_lock) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_status.state == MYPICO_SYNC_CONNECTING
         && now_ms - s_started_ms >= SYNC_CONNECT_TIMEOUT_MS) {
@@ -563,6 +766,320 @@ void mypico_sync_get_status(mypico_sync_status_t* out) {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     *out = s_status;
     xSemaphoreGive(s_lock);
+}
+
+/* ---- SNTP 网络校时实现 / SNTP network time calibration implementation ---- */
+
+esp_err_t mypico_sntp_start(void) {
+    ensure_lock();
+    mypico_sntp_stop();
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memset(&s_sntp, 0, sizeof(s_sntp));
+    s_sntp_got_unix = 0;
+    s_sntp_need_teardown = false;
+    xSemaphoreGive(s_lock);
+
+    saved_wifi_cred_t cred;
+    if (!load_saved_wifi(&cred)) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_sntp.state = MYPICO_SNTP_NO_WIFI;
+        snprintf(
+            s_sntp.message, sizeof(s_sntp.message),
+            "未保存 Wi-Fi，请先进入「Wi-Fi / 热点配网」连接一次。"
+        );
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool reuse = s_wifi_started && s_sta_connected && strcmp(s_sta_ssid, cred.ssid) == 0;
+    char reuse_ip[20] = {0};
+    if (reuse) strcpy(reuse_ip, s_sta_ip);
+    snprintf(s_sntp.ssid, sizeof(s_sntp.ssid), "%s", cred.ssid);
+    s_sntp_active = true;
+    s_bg_active = false;
+    s_bg_sntp_running = false;
+    s_started_ms = esp_timer_get_time() / 1000;
+    s_retries = 0;
+    if (reuse) {
+        s_sntp.state = MYPICO_SNTP_SYNCING;
+        s_sntp_sync_ms = s_started_ms;
+        snprintf(s_sntp.message, sizeof(s_sntp.message), "已复用 Wi-Fi (%s)，正在对时…", reuse_ip);
+    } else {
+        s_sntp.state = MYPICO_SNTP_CONNECTING;
+        snprintf(s_sntp.message, sizeof(s_sntp.message), "正在连接 %s…", cred.ssid);
+    }
+    xSemaphoreGive(s_lock);
+
+    if (reuse) {
+        memset(&cred, 0, sizeof(cred));
+        start_sntp_client();
+        return ESP_OK;
+    }
+
+    if (s_wifi_started || s_wifi_inited) {
+        stop_sta_wifi();
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_sntp_active = true;
+    xSemaphoreGive(s_lock);
+
+    esp_err_t err = start_sta_wifi(&cred, WIFI_PS_MIN_MODEM);
+    memset(&cred, 0, sizeof(cred));
+    if (err == ESP_OK) return ESP_OK;
+
+    stop_sta_wifi();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_sntp_active = false;
+    s_sntp.state = MYPICO_SNTP_ERROR;
+    snprintf(s_sntp.message, sizeof(s_sntp.message), "Wi-Fi 启动失败 (%s)", esp_err_to_name(err));
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
+void mypico_sntp_stop(void) {
+    ensure_lock();
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool was_sntp = s_sntp_active;
+    s_sntp_active = false;
+    s_sntp_got_unix = 0;
+    s_sntp_need_teardown = false;
+    bool keep = should_keep_wifi_now() && s_wifi_started && s_sta_connected;
+    if (keep && !s_sync_active) s_bg_active = true;
+    xSemaphoreGive(s_lock);
+
+    if (was_sntp) {
+        if (keep) {
+            (void)esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+        } else if (!s_sync_active) {
+            stop_sta_wifi();
+        }
+    }
+}
+
+void mypico_sntp_poll(int64_t now_ms) {
+    if (!s_lock) return;
+
+    uint32_t got_unix = 0;
+    bool teardown_err = false;
+    bool wifi_timeout = false;
+    bool ntp_timeout = false;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_sntp_active) {
+        got_unix = s_sntp_got_unix;
+        teardown_err = s_sntp_need_teardown;
+        if (!got_unix && !teardown_err) {
+            if (s_sntp.state == MYPICO_SNTP_CONNECTING
+                && now_ms - s_started_ms >= SYNC_CONNECT_TIMEOUT_MS) {
+                wifi_timeout = true;
+            } else if (s_sntp.state == MYPICO_SNTP_SYNCING
+                       && now_ms - s_sntp_sync_ms >= SNTP_SYNC_TIMEOUT_MS) {
+                ntp_timeout = true;
+            }
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    if (got_unix >= MYPICO_TIME_VALID_MIN) {
+        bool rtc_ok = ui_statusbar_set_unix_time(got_unix);
+        if (esp_sntp_enabled()) esp_sntp_stop();
+        bool keep = should_keep_wifi_now() && s_wifi_started && s_sta_connected;
+        if (keep) {
+            (void)esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+        } else {
+            stop_sta_wifi();
+        }
+
+        char date_str[16], hm_str[8];
+        int16_t tz = app_settings_tz_offset_min();
+        ui_statusbar_format_date(got_unix, tz, date_str);
+        ui_statusbar_format_hm(got_unix, tz, hm_str);
+
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_sntp_active = false;
+        s_sntp_got_unix = 0;
+        s_boot_sntp_done = true;
+        if (keep) s_bg_active = true;
+        if (rtc_ok) {
+            s_sntp.state = MYPICO_SNTP_DONE;
+            s_sntp.synced_unix = got_unix;
+            snprintf(
+                s_sntp.message, sizeof(s_sntp.message),
+                keep ? "校时成功：%s %s（保持 Wi-Fi）" : "校时成功：%s %s（Wi-Fi 已关闭）",
+                date_str, hm_str
+            );
+            ESP_LOGI(TAG, "SNTP synced RTC: %s %s (unix=%u, keep_wifi=%d)",
+                     date_str, hm_str, (unsigned)got_unix, (int)keep);
+        } else {
+            s_sntp.state = MYPICO_SNTP_ERROR;
+            snprintf(s_sntp.message, sizeof(s_sntp.message), "已获取时间，但写入 PMU RTC 失败。");
+        }
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    if (teardown_err || wifi_timeout || ntp_timeout) {
+        if (esp_sntp_enabled()) esp_sntp_stop();
+        bool keep = !teardown_err && !wifi_timeout && should_keep_wifi_now() && s_wifi_started && s_sta_connected;
+        if (keep) {
+            (void)esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+        } else {
+            stop_sta_wifi();
+        }
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_sntp_active = false;
+        s_sntp_need_teardown = false;
+        if (keep) s_bg_active = true;
+        s_sntp.state = MYPICO_SNTP_ERROR;
+        if (wifi_timeout) {
+            snprintf(s_sntp.message, sizeof(s_sntp.message), "Wi-Fi 连接超时，请检查网络后重试。");
+        } else if (ntp_timeout) {
+            snprintf(s_sntp.message, sizeof(s_sntp.message), "NTP 对时超时，请确认网络可访问公网。");
+        }
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void mypico_sntp_get_status(mypico_sntp_status_t* out) {
+    if (!out) return;
+    ensure_lock();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    *out = s_sntp;
+    xSemaphoreGive(s_lock);
+}
+
+/* ---- 全局 Wi-Fi 常驻管理 / Persistent STA Wi-Fi keep-alive ---- */
+
+void mypico_wifi_tick(int64_t now_ms) {
+    ensure_lock();
+    if (s_wifi_yielded || s_wifi_suspended) return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool fg_busy = s_sync_active || s_sntp_active;
+    bool bg_teardown = s_bg_need_teardown;
+    uint32_t bg_unix = s_bg_sntp_got_unix;
+    bool bg_sntp_to = s_bg_sntp_running && (now_ms - s_bg_sntp_ms >= SNTP_SYNC_TIMEOUT_MS);
+    bool bg_conn_to = s_bg_active && s_wifi_started && !s_sta_connected
+        && (now_ms - s_started_ms >= SYNC_CONNECT_TIMEOUT_MS);
+    bool running = s_wifi_started;
+    int64_t backoff_until = s_bg_backoff_until_ms;
+    xSemaphoreGive(s_lock);
+
+    if (fg_busy) return;
+
+    if (bg_unix >= MYPICO_TIME_VALID_MIN) {
+        (void)ui_statusbar_set_unix_time(bg_unix);
+        if (esp_sntp_enabled()) esp_sntp_stop();
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_bg_sntp_running = false;
+        s_bg_sntp_got_unix = 0;
+        s_boot_sntp_done = true;
+        xSemaphoreGive(s_lock);
+        ESP_LOGI(TAG, "Background SNTP synced RTC (unix=%u)", (unsigned)bg_unix);
+    } else if (bg_sntp_to) {
+        if (esp_sntp_enabled()) esp_sntp_stop();
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_bg_sntp_running = false;
+        s_boot_sntp_done = true;
+        xSemaphoreGive(s_lock);
+    }
+
+    if (bg_teardown || bg_conn_to) {
+        stop_sta_wifi();
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_bg_backoff_until_ms = now_ms + WIFI_BG_BACKOFF_MS;
+        xSemaphoreGive(s_lock);
+        ESP_LOGI(TAG, "Background Wi-Fi unreachable, backing off %d s", WIFI_BG_BACKOFF_MS / 1000);
+        return;
+    }
+
+    bool want = should_keep_wifi_now();
+    if (!want) {
+        if (running) {
+            ESP_LOGI(TAG, "Stopping persistent Wi-Fi per policy");
+            stop_sta_wifi();
+        }
+        return;
+    }
+
+    if (!running && now_ms >= backoff_until) {
+        saved_wifi_cred_t cred;
+        if (!load_saved_wifi(&cred)) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_bg_backoff_until_ms = now_ms + WIFI_BG_BACKOFF_MS;
+            xSemaphoreGive(s_lock);
+            return;
+        }
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_bg_active = true;
+        s_started_ms = now_ms;
+        s_retries = 0;
+        xSemaphoreGive(s_lock);
+
+        ESP_LOGI(TAG, "Starting persistent Wi-Fi (MAX_MODEM) to %s", cred.ssid);
+        esp_err_t err = start_sta_wifi(&cred, WIFI_PS_MAX_MODEM);
+        memset(&cred, 0, sizeof(cred));
+        if (err != ESP_OK) {
+            stop_sta_wifi();
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_bg_backoff_until_ms = now_ms + WIFI_BG_BACKOFF_MS;
+            xSemaphoreGive(s_lock);
+        }
+    }
+}
+
+void mypico_wifi_yield(bool yield) {
+    ensure_lock();
+    s_wifi_yielded = yield;
+    if (yield) {
+        mypico_sync_stop();
+        mypico_sntp_stop();
+        stop_sta_wifi();
+    } else {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_bg_backoff_until_ms = 0;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void mypico_wifi_suspend(bool suspend) {
+    ensure_lock();
+    s_wifi_suspended = suspend;
+    if (suspend) {
+        if (s_wifi_started || s_wifi_inited) {
+            mypico_sync_stop();
+            mypico_sntp_stop();
+            stop_sta_wifi();
+        }
+    } else {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_bg_backoff_until_ms = 0;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void mypico_wifi_policy_changed(int64_t now_ms) {
+    ensure_lock();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_bg_backoff_until_ms = 0;
+    xSemaphoreGive(s_lock);
+    mypico_wifi_tick(now_ms);
+}
+
+bool mypico_wifi_is_connected(char* out_ssid, size_t cap) {
+    ensure_lock();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool ok = s_wifi_started && s_sta_connected;
+    if (ok && out_ssid && cap > 0) {
+        snprintf(out_ssid, cap, "%s", s_sta_ssid);
+    }
+    xSemaphoreGive(s_lock);
+    return ok;
 }
 
 #endif

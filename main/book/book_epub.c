@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <ctype.h>
 
@@ -566,12 +567,116 @@ esp_err_t book_epub_chapter_title(const book_epub_t *book, size_t i, char *buf, 
     if (n >= cap) return ESP_ERR_INVALID_SIZE;
     memcpy(buf, book->chapters[i].title, n + 1); return ESP_OK;
 }
+// 从章节头部提取最多两个外部样式表（上限 64 KiB），失败忽略以不阻塞正文读取。
+// Load up to two linked chapter CSS stylesheets (capped at 64 KiB); failures never block body text.
+static void load_linked_css(
+    book_epub_t *book, const char *base_path, const char *html, size_t len,
+    char **out_css, size_t *out_len
+) {
+    *out_css = NULL;
+    *out_len = 0;
+    if (!book || !base_path || !html || !len) return;
+    size_t scan_lim = len < 8192 ? len : 8192;
+    size_t loaded = 0;
+    const size_t max_total = 64u * 1024u;
+    for (size_t pos = 0; pos + 5 < scan_lim && loaded < 2; ++pos) {
+        if (html[pos] != '<') continue;
+        // 遇到 </head> 或 <body 即停止扫描。/ Stop scanning at </head> or <body>.
+        if (pos + 6 < scan_lim && html[pos + 1] == '/' &&
+            (html[pos + 2] == 'h' || html[pos + 2] == 'H') &&
+            (html[pos + 3] == 'e' || html[pos + 3] == 'E') &&
+            (html[pos + 4] == 'a' || html[pos + 4] == 'A') &&
+            (html[pos + 5] == 'd' || html[pos + 5] == 'D')) break;
+        if (pos + 5 < scan_lim &&
+            (html[pos + 1] == 'b' || html[pos + 1] == 'B') &&
+            (html[pos + 2] == 'o' || html[pos + 2] == 'O') &&
+            (html[pos + 3] == 'd' || html[pos + 3] == 'D') &&
+            (html[pos + 4] == 'y' || html[pos + 4] == 'Y')) break;
+        if (!((html[pos + 1] == 'l' || html[pos + 1] == 'L') &&
+              (html[pos + 2] == 'i' || html[pos + 2] == 'I') &&
+              (html[pos + 3] == 'n' || html[pos + 3] == 'N') &&
+              (html[pos + 4] == 'k' || html[pos + 4] == 'K') &&
+              (html[pos + 5] == ' ' || html[pos + 5] == '\t' || html[pos + 5] == '\r' || html[pos + 5] == '\n'))) {
+            continue;
+        }
+        size_t end = pos + 5;
+        char q = 0;
+        while (end < scan_lim) {
+            char c = html[end];
+            if (q) { if (c == q) q = 0; }
+            else if (c == '"' || c == '\'') q = c;
+            else if (c == '>') break;
+            ++end;
+        }
+        if (end >= scan_lim) break;
+        const char *tag = html + pos + 5;
+        size_t tlen = end - (pos + 5);
+        pos = end;
+
+        // 仅处理 stylesheet / text/css 链接。/ Only load stylesheet / text/css links.
+        bool is_css = false;
+        char href[256] = "";
+        for (size_t k = 0; k < tlen;) {
+            while (k < tlen && (tag[k] == ' ' || tag[k] == '\t' || tag[k] == '\r' || tag[k] == '\n')) ++k;
+            size_t ns = k;
+            while (k < tlen && tag[k] != '=' && tag[k] != ' ' && tag[k] != '/' && tag[k] != '>') ++k;
+            size_t nl = k - ns;
+            while (k < tlen && (tag[k] == ' ' || tag[k] == '\t')) ++k;
+            if (k >= tlen || tag[k] != '=') { ++k; continue; }
+            ++k;
+            while (k < tlen && (tag[k] == ' ' || tag[k] == '\t')) ++k;
+            if (k >= tlen || (tag[k] != '"' && tag[k] != '\'')) continue;
+            char qt = tag[k++];
+            size_t vs = k;
+            while (k < tlen && tag[k] != qt) ++k;
+            size_t vl = k - vs;
+            if (k < tlen) ++k;
+            if (nl == 3 && (tag[ns] == 'r' || tag[ns] == 'R') && (tag[ns + 1] == 'e' || tag[ns + 1] == 'E') &&
+                (tag[ns + 2] == 'l' || tag[ns + 2] == 'L')) {
+                if (vl == 10 && !strncasecmp(tag + vs, "stylesheet", 10)) is_css = true;
+            } else if (nl == 4 && !strncasecmp(tag + ns, "type", 4)) {
+                if (vl == 8 && !strncasecmp(tag + vs, "text/css", 8)) is_css = true;
+            } else if (nl == 4 && !strncasecmp(tag + ns, "href", 4) && vl > 0 && vl < sizeof(href)) {
+                memcpy(href, tag + vs, vl);
+                href[vl] = 0;
+            }
+        }
+        if (!is_css || !href[0]) continue;
+        char resolved[EPUB_PATH_CAP];
+        if (!resolve_path(base_path, href, resolved)) continue;
+        int idx = zip_find(book->zip, resolved);
+        if (idx < 0) continue;
+        size_t rem = max_total - *out_len;
+        if (rem < 16) break;
+        char *buf = NULL;
+        size_t blen = 0;
+        if (load_entry_limit(book, idx, &buf, &blen, rem) != ESP_OK || !buf || !blen) {
+            free(buf);
+            continue;
+        }
+        char *merged = heap_caps_realloc(*out_css, *out_len + blen + 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!merged) { free(buf); break; }
+        *out_css = merged;
+        if (*out_len > 0) (*out_css)[(*out_len)++] = '\n';
+        memcpy(*out_css + *out_len, buf, blen);
+        *out_len += blen;
+        (*out_css)[*out_len] = 0;
+        free(buf);
+        ++loaded;
+    }
+}
+
 esp_err_t book_epub_load(book_epub_t *book, size_t i, html_text_t *out) {
     if (!out) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out)); if (!book || i >= book->count) return ESP_ERR_INVALID_ARG;
     char *text; size_t len; esp_err_t err = load_entry(book, book->chapters[i].zip_index, &text, &len);
     if (err != ESP_OK) return err;
-    err = html_to_blocks(text, len, out); free(text);
+    const char *chapter_path = zip_entry_name(book->zip, book->chapters[i].zip_index);
+    char *css = NULL; size_t css_len = 0;
+    load_linked_css(book, chapter_path, text, len, &css, &css_len);
+    err = html_to_blocks_css(text, len, css, css_len, out);
+    free(css);
+    free(text);
     if (err != ESP_OK) return err;
     // 仅把章首连续图片后紧接标题的结构当作标题图，普通正文前图不推断。
     // Identify title images only when opening image blocks lead directly into a heading, not ordinary body text.

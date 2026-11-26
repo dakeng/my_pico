@@ -42,23 +42,51 @@
 #define TAG "mypico_shelf"
 
 #define SHELF_PER_PAGE 3
+// 书架卡片布局常量：严格按 Figma 585×1040 -> 684×1216 (×76/65) 等比换算。
+// Shelf card layout constants scaled proportionally from Figma 585x1040 to 684x1216 (x76/65).
 #define SHELF_CARD_TOP 75
 #define SHELF_CARD_STRIDE 344
-#define SHELF_CARD_H 316
+#define SHELF_CARD_H 296
 #define SHELF_COVER_X MYPICO_MARGIN
 #define SHELF_COVER_W BOOK_COVER_W
 #define SHELF_COVER_H BOOK_COVER_H
-#define SHELF_INFO_X (MYPICO_MARGIN + SHELF_COVER_W + 28)
+#define SHELF_COVER_GAP 28
+#define SHELF_INFO_X (MYPICO_MARGIN + SHELF_COVER_W + SHELF_COVER_GAP)
 #define SHELF_INFO_W (UI_LOCK_WIDTH - MYPICO_MARGIN - SHELF_INFO_X)
 
-#define NOTES_TITLE_Y 74
-#define NOTES_LIST_TOP 156
+// 书架信息列视觉字号（em 像素）与各行垂直中心偏移（相对于卡片顶部 top）。
+// Metadata column target em sizes and per-row vertical center offsets relative to card top.
+#define SHELF_TITLE_EM 37
+#define SHELF_META_EM 28
+// 「同步」「查看笔记」按钮：Figma 20px (×76/65 ≈ 23em)，左右 padding 16 (×76/65 ≈ 19px)。
+// Sync / Notes pills: Figma 20px (x76/65 ~= 23em) with 16px horizontal padding (x76/65 ~= 19px).
+#define SHELF_BTN_EM 23
+#define SHELF_TITLE_CY 25
+#define SHELF_AUTHOR_CY 77
+#define SHELF_PROGRESS_CY 122
+#define SHELF_DURATION_CY 168
+#define SHELF_LASTREAD_CY 213
+#define SHELF_ROW6_Y 241
+#define SHELF_ROW6_H 55
+#define SHELF_ROW6_CY (SHELF_ROW6_Y + SHELF_ROW6_H / 2)
+#define SHELF_BTN_H 49
+#define SHELF_ROW6_HL_GAP 14
+#define SHELF_ROW6_BTN_GAP 10
+#define SHELF_PILL_PAD_X 19
+#define SHELF_SYNC_BTN_W 84
+#define SHELF_NOTES_BTN_W 130
+
+// 笔记页常量：对齐 Figma「笔记 (9:264)」×76/65。
+// Notes view constants matching Figma Notes (9:264) scaled by 76/65.
+#define NOTES_TITLE_CY 101
+#define NOTES_TITLE_EM 42
+#define NOTES_LIST_TOP 157
 #define NOTES_LIST_BOTTOM (MYPICO_ACTIONBAR_Y - 16)
 #define NOTES_BAR_W 5
-#define NOTES_TEXT_GAP 12
-#define NOTES_TEXT_PX 28
-#define NOTES_LINE_H 40
-#define NOTES_ITEM_GAP 24
+#define NOTES_TEXT_GAP 10
+#define NOTES_TEXT_EM 37
+#define NOTES_LINE_H 49
+#define NOTES_ITEM_GAP 28
 #define NOTES_MAX_PAGES 64
 
 typedef enum {
@@ -196,7 +224,18 @@ static void hydrate_visible_metadata(void) {
             book_data_record_free(&rec);
             continue;
         }
-        if (!rec.meta_parsed || (!rec.author[0] && !rec.has_cover)) {
+        bool cover_dim_stale = false;
+        if (rec.has_cover) {
+            uint16_t cw = 0, ch = 0;
+            uint8_t* tmp = NULL;
+            if (book_data_cover_load(rec.book_id, &cw, &ch, &tmp) == ESP_OK) {
+                cover_dim_stale = (cw != SHELF_COVER_W || ch != SHELF_COVER_H);
+                free(tmp);
+            } else {
+                cover_dim_stale = true;
+            }
+        }
+        if (!rec.meta_parsed || (!rec.author[0] && !rec.has_cover) || cover_dim_stale) {
             book_epub_meta_t meta;
             if (book_epub_read_meta(it->file_path, &meta) == ESP_OK) {
                 if (meta.title[0]) copy_str(rec.title, sizeof(rec.title), meta.title);
@@ -207,6 +246,11 @@ static void hydrate_visible_metadata(void) {
                             it->file_path, SHELF_COVER_W, SHELF_COVER_H, &thumb) == ESP_OK) {
                         if (book_data_cover_save(rec.book_id, SHELF_COVER_W, SHELF_COVER_H, thumb) == ESP_OK) {
                             rec.has_cover = true;
+                            if (strcmp(s_slot_cover_id[slot], rec.book_id) == 0) {
+                                free(s_slot_cover[slot]);
+                                s_slot_cover[slot] = NULL;
+                                s_slot_cover_id[slot][0] = 0;
+                            }
                         }
                         free(thumb);
                     }
@@ -334,14 +378,37 @@ static EpdRect shelf_card_rect(int slot) {
     };
 }
 
-static EpdRect shelf_sync_btn_rect(int slot) {
-    int y = SHELF_CARD_TOP + slot * SHELF_CARD_STRIDE + 260;
-    return (EpdRect){ .x = SHELF_INFO_X, .y = y, .width = 76, .height = 48 };
-}
+// 第 6 行「划线：N  [同步]  [查看笔记]」横向排布，绘制与点击命中共用同一套几何。
+// Row 6 ("划线：N [同步] [查看笔记]") horizontal layout shared by rendering and touch hit-testing.
+static void shelf_row6_rects(int slot, EpdRect* out_sync, EpdRect* out_notes) {
+    int base = s_shelf_page * SHELF_PER_PAGE;
+    int idx = base + slot;
+    uint32_t hl_count = (idx >= 0 && idx < s_item_count && s_items) ? s_items[idx].highlight_count : 0;
 
-static EpdRect shelf_notes_btn_rect(int slot) {
-    int y = SHELF_CARD_TOP + slot * SHELF_CARD_STRIDE + 260;
-    return (EpdRect){ .x = SHELF_INFO_X + 76 + 12, .y = y, .width = 126, .height = 48 };
+    char hl_str[32];
+    snprintf(hl_str, sizeof(hl_str), "划线：%u", (unsigned)hl_count);
+    int meta_px = ui_mypico_em_to_px(SHELF_META_EM);
+    int btn_px = ui_mypico_em_to_px(SHELF_BTN_EM);
+    int hl_w = ttf_text_width_px(meta_px, hl_str);
+
+    int sync_w = ttf_text_width_px(btn_px, "同步") + SHELF_PILL_PAD_X * 2;
+    if (sync_w < SHELF_SYNC_BTN_W) sync_w = SHELF_SYNC_BTN_W;
+    int notes_w = ttf_text_width_px(btn_px, "查看笔记") + SHELF_PILL_PAD_X * 2;
+    if (notes_w < SHELF_NOTES_BTN_W) notes_w = SHELF_NOTES_BTN_W;
+
+    int y = SHELF_CARD_TOP + slot * SHELF_CARD_STRIDE + SHELF_ROW6_CY - SHELF_BTN_H / 2;
+    int sync_x = SHELF_INFO_X + hl_w + SHELF_ROW6_HL_GAP;
+    int max_sync_x = SHELF_INFO_X + SHELF_INFO_W - sync_w - SHELF_ROW6_BTN_GAP - notes_w;
+    if (sync_x > max_sync_x) sync_x = max_sync_x;
+    if (sync_x < SHELF_INFO_X) sync_x = SHELF_INFO_X;
+    int notes_x = sync_x + sync_w + SHELF_ROW6_BTN_GAP;
+
+    if (out_sync) {
+        *out_sync = (EpdRect){ .x = sync_x, .y = y, .width = sync_w, .height = SHELF_BTN_H };
+    }
+    if (out_notes) {
+        *out_notes = (EpdRect){ .x = notes_x, .y = y, .width = notes_w, .height = SHELF_BTN_H };
+    }
 }
 
 static void draw_truncated_text(uint8_t* fb, int x, int y, int px, int max_w, const char* src) {
@@ -367,6 +434,43 @@ static void draw_truncated_text(uint8_t* fb, int x, int y, int px, int max_w, co
     ui_text(fb, x, y, px, buf, EPD_DRAW_ALIGN_LEFT, false);
 }
 
+static void draw_truncated_text_vc(
+    uint8_t* fb, int x, int cy, int px, int wght, int max_w, const char* src
+) {
+    char buf[160];
+    strncpy(buf, src ? src : "", sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    bool clipped = false;
+    while (buf[0] && ttf_text_width_px(px, buf) > max_w) {
+        size_t n = strlen(buf) - 1;
+        while (n > 0 && ((unsigned char)buf[n] & 0xC0) == 0x80) --n;
+        buf[n] = 0;
+        clipped = true;
+    }
+    if (clipped && strlen(buf) + 4 < sizeof(buf)) {
+        size_t n = strlen(buf);
+        if (n >= 3) {
+            size_t m = n - 1;
+            while (m > 0 && ((unsigned char)buf[m] & 0xC0) == 0x80) --m;
+            buf[m] = 0;
+        }
+        strcat(buf, "…");
+    }
+    int old = ttf_get_weight();
+    ttf_set_weight(wght);
+    ui_text_vc(fb, x, cy, px, buf, EPD_DRAW_ALIGN_LEFT, false);
+    ttf_set_weight(old);
+}
+
+static void draw_text_vc_wght(
+    uint8_t* fb, int x, int cy, int px, int wght, const char* text
+) {
+    int old = ttf_get_weight();
+    ttf_set_weight(wght);
+    ui_text_vc(fb, x, cy, px, text, EPD_DRAW_ALIGN_LEFT, false);
+    ttf_set_weight(old);
+}
+
 static int wrap_note_text(
     uint8_t* fb, int x, int y, int max_w, int px, int line_h, const char* text, int max_lines
 );
@@ -376,9 +480,17 @@ static void draw_cover_slot(uint8_t* fb, int slot, const shelf_item_t* it, int x
         uint16_t cw = s_slot_cover_w[slot];
         uint16_t ch = s_slot_cover_h[slot];
         const uint8_t* pix = s_slot_cover[slot];
-        for (int py = 0; py < SHELF_COVER_H && py < ch; ++py) {
-            for (int px = 0; px < SHELF_COVER_W && px < cw; ++px) {
-                epd_draw_pixel(x + px, y + py, pix[(size_t)py * cw + px], fb);
+        for (int py = 0; py < SHELF_COVER_H; ++py) {
+            int sy = (cw == SHELF_COVER_W && ch == SHELF_COVER_H)
+                ? py
+                : (int)((uint32_t)py * ch / SHELF_COVER_H);
+            if (sy >= ch) sy = ch - 1;
+            for (int px = 0; px < SHELF_COVER_W; ++px) {
+                int sx = (cw == SHELF_COVER_W && ch == SHELF_COVER_H)
+                    ? px
+                    : (int)((uint32_t)px * cw / SHELF_COVER_W);
+                if (sx >= cw) sx = cw - 1;
+                epd_draw_pixel(x + px, y + py, pix[(size_t)sy * cw + sx], fb);
             }
         }
         // 细浅灰描边使浅色封面也有清晰边界。
@@ -390,14 +502,18 @@ static void draw_cover_slot(uint8_t* fb, int slot, const shelf_item_t* it, int x
     // 无封面图时绘制简洁的纸书占位封面（内嵌书名）。
     // Minimal book cover placeholder showing the book title when no image is available.
     EpdRect box = { x, y, SHELF_COVER_W, SHELF_COVER_H };
-    epd_fill_rect(box, 0xE8, fb);
+    epd_fill_rect(box, 0xE0, fb);
     epd_draw_rect(box, UI_GRAY_LIGHT, fb);
-    ui_hairline(fb, y + 20, x + 14, SHELF_COVER_W - 28, UI_GRAY_LIGHT);
+    ui_hairline(fb, y + 22, x + 14, SHELF_COVER_W - 28, UI_GRAY_LIGHT);
     ui_hairline(fb, y + SHELF_COVER_H - 22, x + 14, SHELF_COVER_W - 28, UI_GRAY_LIGHT);
+    int ph_px = ui_mypico_em_to_px(22);
+    int old = ttf_get_weight();
+    ttf_set_weight(MYPICO_WGHT_MEDIUM);
     wrap_note_text(
-        fb, x + 14, y + 36, SHELF_COVER_W - 28, 22, 30,
+        fb, x + 14, y + 36, SHELF_COVER_W - 28, ph_px, 34,
         it && it->title[0] ? it->title : "EPUB", 4
     );
+    ttf_set_weight(old);
 }
 
 static void render_shelf(uint8_t* fb) {
@@ -405,17 +521,16 @@ static void render_shelf(uint8_t* fb) {
     ui_statusbar_draw(fb);
 
     if (!s_sd_ready) {
-        ui_text(fb, MYPICO_MARGIN, 180, 30, s_shelf_error, EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, MYPICO_MARGIN, 180, ui_mypico_em_to_px(28), s_shelf_error, EPD_DRAW_ALIGN_LEFT, false);
         ui_mypico_draw_action_bar(fb, "首页", false, false);
         return;
     }
 
     if (s_item_count == 0) {
-        ui_text(fb, MYPICO_MARGIN, 180, 32, "书架还是空的", EPD_DRAW_ALIGN_LEFT, false);
-        ui_text(
-            fb, MYPICO_MARGIN, 240, 26,
-            "请通过「传书 Transfer」或将 EPUB 放入 TF 卡 /books 目录。",
-            EPD_DRAW_ALIGN_LEFT, false
+        draw_text_vc_wght(fb, MYPICO_MARGIN, 196, ui_mypico_em_to_px(32), MYPICO_WGHT_MEDIUM, "书架还是空的");
+        draw_text_vc_wght(
+            fb, MYPICO_MARGIN, 256, ui_mypico_em_to_px(24), MYPICO_WGHT_REGULAR,
+            "请通过「传书 Transfer」或将 EPUB 放入 TF 卡 /books 目录。"
         );
         ui_mypico_draw_action_bar(fb, "首页", false, false);
         return;
@@ -423,6 +538,9 @@ static void render_shelf(uint8_t* fb) {
 
     int base = s_shelf_page * SHELF_PER_PAGE;
     int16_t tz = app_settings_tz_offset_min();
+    int title_px = ui_mypico_em_to_px(SHELF_TITLE_EM);
+    int meta_px = ui_mypico_em_to_px(SHELF_META_EM);
+    int btn_px = ui_mypico_em_to_px(SHELF_BTN_EM);
 
     for (int slot = 0; slot < SHELF_PER_PAGE; ++slot) {
         int idx = base + slot;
@@ -432,33 +550,38 @@ static void render_shelf(uint8_t* fb) {
 
         draw_cover_slot(fb, slot, it, SHELF_COVER_X, top);
 
-        // 右侧信息列严格匹配 Figma 书 item 字段与顺序。
-        // Right metadata column strictly matches the Figma book item fields and order.
-        draw_truncated_text(fb, SHELF_INFO_X, top, 36, SHELF_INFO_W, it->title);
-        draw_truncated_text(
-            fb, SHELF_INFO_X, top + 54, 24, SHELF_INFO_W,
-            it->author[0] ? it->author : "未知作者"
+        // 右侧信息列严格匹配 Figma「书 item (2:11)」字段、字号、字重与行距。
+        // Right metadata column matches Figma book item (2:11) fields, sizing, weights and vertical spacing.
+        draw_truncated_text_vc(
+            fb, SHELF_INFO_X, top + SHELF_TITLE_CY, title_px, MYPICO_WGHT_MEDIUM,
+            SHELF_INFO_W, it->title
+        );
+        draw_truncated_text_vc(
+            fb, SHELF_INFO_X, top + SHELF_AUTHOR_CY, meta_px, MYPICO_WGHT_MEDIUM,
+            SHELF_INFO_W, it->author[0] ? it->author : "未知作者"
         );
 
         char line[64];
         snprintf(line, sizeof(line), "阅读进度：%u%%", (unsigned)it->pct);
-        ui_text(fb, SHELF_INFO_X, top + 92, 24, line, EPD_DRAW_ALIGN_LEFT, false);
+        draw_text_vc_wght(fb, SHELF_INFO_X, top + SHELF_PROGRESS_CY, meta_px, MYPICO_WGHT_REGULAR, line);
 
         char dur[24];
         ui_statusbar_format_duration(it->total_read_sec, dur);
         snprintf(line, sizeof(line), "阅读时长：%s", dur);
-        ui_text(fb, SHELF_INFO_X, top + 130, 24, line, EPD_DRAW_ALIGN_LEFT, false);
+        draw_text_vc_wght(fb, SHELF_INFO_X, top + SHELF_DURATION_CY, meta_px, MYPICO_WGHT_REGULAR, line);
 
         char date[16];
         ui_statusbar_format_date(it->last_read_ts, tz, date);
         snprintf(line, sizeof(line), "最近阅读：%s", date);
-        ui_text(fb, SHELF_INFO_X, top + 168, 24, line, EPD_DRAW_ALIGN_LEFT, false);
+        draw_text_vc_wght(fb, SHELF_INFO_X, top + SHELF_LASTREAD_CY, meta_px, MYPICO_WGHT_REGULAR, line);
 
         snprintf(line, sizeof(line), "划线：%u", (unsigned)it->highlight_count);
-        ui_text(fb, SHELF_INFO_X, top + 206, 24, line, EPD_DRAW_ALIGN_LEFT, false);
+        draw_text_vc_wght(fb, SHELF_INFO_X, top + SHELF_ROW6_CY, meta_px, MYPICO_WGHT_REGULAR, line);
 
-        ui_mypico_draw_pill(fb, shelf_sync_btn_rect(slot), 24, "同步", true);
-        ui_mypico_draw_pill(fb, shelf_notes_btn_rect(slot), 24, "查看笔记", true);
+        EpdRect sync_r, notes_r;
+        shelf_row6_rects(slot, &sync_r, &notes_r);
+        ui_mypico_draw_pill(fb, sync_r, btn_px, "同步", true);
+        ui_mypico_draw_pill(fb, notes_r, btn_px, "查看笔记", true);
     }
 
     bool can_prev = s_shelf_page > 0;
@@ -501,7 +624,7 @@ static int wrap_note_text(
         }
         line[len] = 0;
         if (fb && len > 0) {
-            ui_text(fb, x, y + lines * line_h, px, line, EPD_DRAW_ALIGN_LEFT, false);
+            ui_text_vc(fb, x, y + lines * line_h + line_h / 2, px, line, EPD_DRAW_ALIGN_LEFT, false);
         }
         lines++;
         if (*p == '\r') ++p;
@@ -517,10 +640,11 @@ static void paginate_notes(void) {
     if (s_notes_rec.highlight_count == 0) return;
 
     const int text_w = MYPICO_CONTENT_W - NOTES_BAR_W - NOTES_TEXT_GAP;
+    const int text_px = ui_mypico_em_to_px(NOTES_TEXT_EM);
     int y = NOTES_LIST_TOP;
     for (size_t i = 0; i < s_notes_rec.highlight_count; ++i) {
         int lines = wrap_note_text(
-            NULL, 0, 0, text_w, NOTES_TEXT_PX, NOTES_LINE_H, s_notes_rec.highlights[i].text, 12
+            NULL, 0, 0, text_w, text_px, NOTES_LINE_H, s_notes_rec.highlights[i].text, 12
         );
         int h = lines * NOTES_LINE_H;
         if (y > NOTES_LIST_TOP && y + h > NOTES_LIST_BOTTOM) {
@@ -547,13 +671,15 @@ static void render_notes(uint8_t* fb) {
 
     char header[192];
     snprintf(header, sizeof(header), "笔记：%s", s_notes_rec.title);
-    draw_truncated_text(fb, MYPICO_MARGIN, NOTES_TITLE_Y, 36, MYPICO_CONTENT_W, header);
+    draw_truncated_text_vc(
+        fb, MYPICO_MARGIN, NOTES_TITLE_CY, ui_mypico_em_to_px(NOTES_TITLE_EM),
+        MYPICO_WGHT_MEDIUM, MYPICO_CONTENT_W, header
+    );
 
     if (s_notes_rec.highlight_count == 0) {
-        ui_text(
-            fb, MYPICO_MARGIN, NOTES_LIST_TOP + 20, 28,
-            "暂无划线笔记。在阅读页面长按并拖动即可划线。",
-            EPD_DRAW_ALIGN_LEFT, false
+        draw_text_vc_wght(
+            fb, MYPICO_MARGIN, NOTES_LIST_TOP + 28, ui_mypico_em_to_px(26), MYPICO_WGHT_REGULAR,
+            "暂无划线笔记。在阅读页面长按并拖动即可划线。"
         );
     } else {
         int start = s_notes_page_starts[s_notes_page];
@@ -562,23 +688,27 @@ static void render_notes(uint8_t* fb) {
             : (int)s_notes_rec.highlight_count;
         const int text_x = MYPICO_MARGIN + NOTES_BAR_W + NOTES_TEXT_GAP;
         const int text_w = MYPICO_CONTENT_W - NOTES_BAR_W - NOTES_TEXT_GAP;
+        const int text_px = ui_mypico_em_to_px(NOTES_TEXT_EM);
         int y = NOTES_LIST_TOP;
 
+        int old = ttf_get_weight();
+        ttf_set_weight(MYPICO_WGHT_REGULAR);
         for (int i = start; i < end; ++i) {
             int lines = wrap_note_text(
-                NULL, 0, 0, text_w, NOTES_TEXT_PX, NOTES_LINE_H, s_notes_rec.highlights[i].text, 12
+                NULL, 0, 0, text_w, text_px, NOTES_LINE_H, s_notes_rec.highlights[i].text, 12
             );
             int h = lines * NOTES_LINE_H;
             if (y + h > NOTES_LIST_BOTTOM && y > NOTES_LIST_TOP) break;
             // Figma 左侧竖条引用样式 (#d9d9d9 -> 0xD0)。
             // Left vertical quote bar matching Figma (#d9d9d9 -> 0xD0).
-            epd_fill_rect((EpdRect){ MYPICO_MARGIN, y + 4, NOTES_BAR_W, h - 8 }, 0xD0, fb);
+            epd_fill_rect((EpdRect){ MYPICO_MARGIN, y + 6, NOTES_BAR_W, h - 12 }, 0xD0, fb);
             wrap_note_text(
-                fb, text_x, y, text_w, NOTES_TEXT_PX, NOTES_LINE_H,
+                fb, text_x, y, text_w, text_px, NOTES_LINE_H,
                 s_notes_rec.highlights[i].text, 12
             );
             y += h + NOTES_ITEM_GAP;
         }
+        ttf_set_weight(old);
     }
 
     bool can_prev = s_notes_page > 0;
@@ -793,11 +923,13 @@ static app_redraw_t shelf_on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* e
     for (int slot = 0; slot < SHELF_PER_PAGE; ++slot) {
         int idx = base + slot;
         if (idx >= s_item_count) break;
-        if (ui_rect_hit(shelf_sync_btn_rect(slot), ev->x0, ev->y0)) {
+        EpdRect sync_r, notes_r;
+        shelf_row6_rects(slot, &sync_r, &notes_r);
+        if (ui_rect_hit(sync_r, ev->x0, ev->y0)) {
             start_sync_for_item(&s_items[idx]);
             return APP_REDRAW_PAGE;
         }
-        if (ui_rect_hit(shelf_notes_btn_rect(slot), ev->x0, ev->y0)) {
+        if (ui_rect_hit(notes_r, ev->x0, ev->y0)) {
             open_notes_for_item(&s_items[idx]);
             return APP_REDRAW_PAGE;
         }

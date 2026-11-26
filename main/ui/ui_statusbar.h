@@ -24,13 +24,18 @@
 extern "C" {
 #endif
 
-// 依据 Figma 585x1040 -> 684x1216 (×1.169) 等比映射的 MyPico 排版常量。
-// MyPico layout constants scaled proportionally from Figma 585x1040 to 684x1216 (x1.169).
+// 依据 Figma 585x1040 -> 684x1216 (×76/65) 等比映射的 MyPico 排版常量。
+// MyPico layout constants scaled proportionally from Figma 585x1040 to 684x1216 (x76/65).
 #define MYPICO_MARGIN 38
 #define MYPICO_CONTENT_W (UI_LOCK_WIDTH - 2 * MYPICO_MARGIN)
 #define MYPICO_STATUSBAR_H 56
 #define MYPICO_ACTIONBAR_H 110
 #define MYPICO_ACTIONBAR_Y (UI_LOCK_HEIGHT - MYPICO_ACTIONBAR_H)
+
+// 匹配 Figma IBM Plex Sans Regular / Medium 在可变字体下的字重。
+// Variable-font weights matching Figma Regular and Medium hierarchy on e-ink.
+#define MYPICO_WGHT_REGULAR 400
+#define MYPICO_WGHT_MEDIUM 500
 
 // 2020-01-01 00:00:00 UTC 作为 RTC 已校准的最小阈值。
 // 2020-01-01 00:00:00 UTC as the minimum valid calibrated RTC timestamp.
@@ -69,6 +74,10 @@ void ui_statusbar_draw(uint8_t* fb);
 EpdRect ui_mypico_bar_home_rect(void);
 EpdRect ui_mypico_bar_prev_rect(void);
 EpdRect ui_mypico_bar_next_rect(void);
+
+/// 将目标视觉字高（em 像素，对齐 Figma CSS font-size × 76/65）换算为当前字体的 ttf_draw_text_px 参数。
+/// Convert target visual em size (Figma CSS font-size x 76/65) to pixel_height for the active TTF font.
+int ui_mypico_em_to_px(int target_em_px);
 
 /// 纯绘制：底部灰色圆角胶囊按钮（匹配 Figma rgba(0,0,0,0.05) 风格）。
 /// Pure paint: light-gray pill button matching Figma rgba(0,0,0,0.05) style.

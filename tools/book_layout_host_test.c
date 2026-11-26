@@ -200,6 +200,57 @@ int main(void) {
     drawn[0]=0;book_layout_draw_page(&fb,0,r,48);
     assert(strstr(drawn,"标题图") && !strstr(drawn,"重复") && !strstr(drawn,"第 8 节"));
     assert(book_layout_page_count()==before_pages && book_layout_page_start_offset(0)==before_offset);
+
+    // 验证精排样式：首行缩进、中文避头尾禁则、英文按词折行、两端对齐与下划线/命中一致性，以及插图三模式。
+    // Verify rich typography: indent, CJK kinsoku, Latin word wrap, justified underline/hit consistency, and 3 image modes.
+    book_layout_style_t st = book_layout_style_default();
+    st.first_line_indent = false;
+    st.align = BOOK_ALIGN_JUSTIFY;
+    st.line_spacing_pct = 50;
+    st.para_spacing_pct = 30;
+    // 避头禁则：宽 40、字号 10（每字宽 10），"甲乙丙丁，戊" 不能让 "，" 出现在第二行首，应回退 "丁" 到第二行。
+    const char kinsoku_txt[] = "甲乙丙丁，戊";
+    r = (EpdRect){0, 0, 40, 100};
+    assert(book_layout_begin_blocks_styled(kinsoku_txt, strlen(kinsoku_txt), NULL, 0, r, 10, &st));
+    assert(book_layout_extend(10));
+    EpdRect bars[8];
+    // 第一行只有 3 字 "甲乙丙"（30px），两端对齐拉伸到 40px（余量 10px <= 35%*40=14px）。
+    size_t bn = book_layout_span_underlines(0, r, 0, 9, bars, 8);
+    assert(bn == 1 && bars[0].x == 0 && bars[0].width == 40);
+    // 命中第 3 字（x=35）应精准落到 "丙"（offset 6..9）。
+    size_t cs = 0, ce = 0;
+    assert(book_layout_char_at(0, r, 35, 5, &cs, &ce, NULL) && cs == 6 && ce == 9);
+    // 英文按词折行：宽 80、字号 10，"ab hello world" 应在 "world" 前折行，不断词。
+    const char en_txt[] = "ab hello world";
+    r = (EpdRect){0, 0, 80, 100};
+    assert(book_layout_begin_blocks_styled(en_txt, strlen(en_txt), NULL, 0, r, 10, &st));
+    assert(book_layout_extend(10));
+    // "ab hello" 宽 80 恰好占第一行，"world" 在第二行。
+    bn = book_layout_span_underlines(0, r, 9, 14, bars, 8);
+    assert(bn == 1 && bars[0].x == 0 && bars[0].width == 50);
+    // 插图三模式：混排 / 占位 / 隐藏。
+    illustrated[1].image = pixels; illustrated[1].image_width = 40; illustrated[1].image_height = 50;
+    r = (EpdRect){40, 24, 604, 1000};
+    st.image_mode = BOOK_IMG_INLINE;
+    assert(book_layout_begin_blocks_styled("a\nimg\nb", 7, illustrated, 3, r, 40, &st));
+    assert(book_layout_extend(10));
+    assert(book_layout_image_at(0, r, 340, 120, &hit) == 1);
+    image_pixels = 0; drawn[0] = 0;
+    book_layout_draw_page(&fb, 0, r, 40);
+    assert(image_pixels > 0);
+    st.image_mode = BOOK_IMG_PLACEHOLDER;
+    assert(book_layout_begin_blocks_styled("a\nimg\nb", 7, illustrated, 3, r, 40, &st));
+    assert(book_layout_extend(10));
+    drawn[0] = 0; book_layout_draw_page(&fb, 0, r, 40);
+    assert(strstr(drawn, "标题图") != NULL);
+    st.image_mode = BOOK_IMG_HIDE;
+    assert(book_layout_begin_blocks_styled("a\nimg\nb", 7, illustrated, 3, r, 40, &st));
+    assert(book_layout_extend(10));
+    assert(book_layout_image_at(0, r, 340, 120, NULL) == SIZE_MAX);
+    image_pixels = 0; drawn[0] = 0;
+    book_layout_draw_page(&fb, 0, r, 40);
+    assert(image_pixels == 0 && strcmp(drawn, "ab") == 0);
+
     book_layout_free();
     puts("book_layout_host_test: PASS");
 }

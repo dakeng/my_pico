@@ -33,6 +33,9 @@
 
 #include "app.h"
 #include "book_store.h"
+#ifdef ESP_PLATFORM
+#include "mypico_sync.h"
+#endif
 #include "book_progress.h"
 #include "display.h"
 #include "e0470_epaper_waveform.h"
@@ -473,6 +476,11 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
 
 static void on_enter(app_ctx_t* ctx) {
     (void)ctx;
+#ifdef ESP_PLATFORM
+    // 进传书页前先让出常驻 STA Wi-Fi，避免与 read_pico_transfer 抢占 esp_wifi 实例。
+    // Yield persistent STA Wi-Fi before Transfer takes exclusive ownership of esp_wifi.
+    mypico_wifi_yield(true);
+#endif
     // 先关闭卡上字库，再开放替换；主循环的字体重试也会被暂停。
     // Close the card font before allowing replacement; event-loop font retries are suspended too.
     s_font_error = ttf_font_suspend_sd(true);
@@ -528,6 +536,9 @@ static void transfer_on_exit(app_ctx_t* ctx) {
     clear_password();
     s_scan_pending = false;
     stop_session();
+#ifdef ESP_PLATFORM
+    mypico_wifi_yield(false);
+#endif
     ttf_font_suspend_sd(false);
     display_set_bulk_io(false);
     guard_draw_result(ctx->hl, update_display_white(ctx->hl));

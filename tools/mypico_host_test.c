@@ -140,11 +140,11 @@ static void test_epub_meta_and_cover(const char* epub_path) {
     assert(strstr(meta.cover_path, "cover.png") != NULL);
 
     uint8_t* thumb = NULL;
-    assert(book_epub_load_cover_thumb(epub_path, 152, 210, &thumb) == ESP_OK);
+    assert(book_epub_load_cover_thumb(epub_path, 168, 234, &thumb) == ESP_OK);
     assert(thumb != NULL);
     // 验证缩略图像素为有效灰度（非全空且内存范围完整可读）。
     size_t sum = 0;
-    for (size_t i = 0; i < 152u * 210u; ++i) sum += thumb[i];
+    for (size_t i = 0; i < 168u * 234u; ++i) sum += thumb[i];
     assert(sum > 0);
     free(thumb);
 

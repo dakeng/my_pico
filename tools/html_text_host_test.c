@@ -92,5 +92,23 @@ int main(void) {
     }
     html_test_fail_after = -1;
     html_text_free(&t);
+    // 验证轻量 CSS、块语义（引用/列表/标题级别/分割线/加粗）及常用排版实体。
+    // Verify lightweight CSS, block semantics (quote/list/heading level/hr/bold), and typography entities.
+    const char* css = ".cap{text-align:center;font-weight:bold;} p.flat{text-indent:0;} blockquote{text-align:left;}";
+    const char* styled_html =
+        "<h1 align='center'>章</h1><p class='cap'>图注&mdash;甲</p><hr>"
+        "<blockquote>引用&hellip;</blockquote><li>列表</li>"
+        "<p class='flat' style='text-align:right'><b>全粗</b></p>"
+        "<p>普<b>局粗</b>通</p><hr>";
+    assert(html_to_blocks_css(styled_html, strlen(styled_html), css, strlen(css), &t) == ESP_OK);
+    assert(t.count == 6);
+    assert(t.blocks[0].heading && t.blocks[0].heading_level == 1 && t.blocks[0].align == BLK_ALIGN_CENTER);
+    assert(!t.blocks[1].heading && t.blocks[1].align == BLK_ALIGN_CENTER && t.blocks[1].bold && t.blocks[1].no_indent);
+    assert(t.blocks[2].quote && t.blocks[2].rule_before && t.blocks[2].align == BLK_ALIGN_LEFT);
+    assert(t.blocks[3].list_item && t.blocks[3].no_indent);
+    assert(t.blocks[4].align == BLK_ALIGN_RIGHT && t.blocks[4].bold && t.blocks[4].no_indent);
+    assert(!t.blocks[5].bold && t.blocks[5].rule_after);
+    assert(strstr(t.utf8, "—") != NULL && strstr(t.utf8, "…") != NULL);
+    html_text_free(&t);
     puts("html_text_host_test: PASS");
 }

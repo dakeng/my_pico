@@ -2,11 +2,13 @@
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  *
- * 中文：把章节 HTML 转为 PSRAM UTF-8 文本与非空块表。
- * English: Convert chapter HTML into PSRAM UTF-8 text and nonempty blocks.
+ * 中文：把章节 HTML 转为 PSRAM UTF-8 文本与带轻量样式的非空块表。
+ * English: Convert chapter HTML into PSRAM UTF-8 text and lightly styled nonempty blocks.
  *
- * 冻结：不加载资源、不执行脚本、不解释 CSS；输入只借用。
- * Frozen: Never load resources, execute scripts or interpret CSS; input is borrowed.
+ * 冻结：不加载外部资源、不执行脚本；输入只借用。
+ * 用户扩展：支持轻量安全 CSS 子集（text-align/font-weight/text-indent）与块语义标签，保持纯文本偏移不变。
+ * Frozen: Never load external resources or execute scripts; input is borrowed.
+ * User expansion: Supports a bounded safe CSS subset (text-align/font-weight/text-indent) and semantic block tags while preserving exact UTF-8 byte offsets.
  */
 #pragma once
 #include <stdbool.h>
@@ -17,10 +19,26 @@
 #define HTML_TEXT_MAX_BYTES (2u * 1024u * 1024u)
 #define HTML_TEXT_MAX_BLOCKS 16384u
 
+typedef enum {
+    BLK_ALIGN_DEFAULT = 0, ///< 跟随阅读器默认对齐 / Follow reader default alignment
+    BLK_ALIGN_LEFT = 1,    ///< 左对齐 / Left alignment
+    BLK_ALIGN_CENTER = 2,  ///< 居中对齐 / Center alignment
+    BLK_ALIGN_RIGHT = 3,   ///< 右对齐 / Right alignment
+    BLK_ALIGN_JUSTIFY = 4, ///< 两端对齐 / Full justification
+} blk_align_t;
+
 typedef struct {
     size_t offset; ///< UTF-8 字节起点 / UTF-8 byte start
     size_t len; ///< 不含段间换行的字节数 / Bytes excluding the block separator
     bool heading; ///< h1–h3 标题块 / h1-h3 heading block
+    uint8_t heading_level; ///< 标题级别 0=正文，1..6=h1..h6 / Heading level 0=body, 1..6=h1..h6
+    uint8_t align; ///< 对齐方式（blk_align_t）/ Block alignment (blk_align_t)
+    bool quote; ///< blockquote/pre 引用块 / Blockquote or preformatted block
+    bool list_item; ///< li 列表项 / List item block
+    bool bold; ///< 块级加粗（CSS/b/strong）/ Block-level bold (CSS/b/strong)
+    bool no_indent; ///< 显式取消首行缩进（text-indent:0 或特殊块）/ Suppress first-line indent
+    bool rule_before; ///< 块前存在水平分割线（hr）/ Horizontal rule before this block
+    bool rule_after; ///< 块后存在水平分割线（hr）/ Horizontal rule after this block
     char* image_src; ///< 图片引用，块表持有；缺失时保持文字占位 / Owned image reference; absent references retain text placeholders
     uint8_t* image; ///< 模块持有的八位灰度图，NULL 时绘制占位 / Owned 8-bit grayscale pixels; NULL renders the placeholder
     uint16_t image_width, image_height; ///< 已缩放图像尺寸 / Resized image dimensions
@@ -38,6 +56,8 @@ typedef struct {
 
 /// 输出须为空；成功交出所有权，失败清空输出；空输入成功且零块。/ Output must be empty; success transfers ownership, failure clears output; empty input succeeds with zero blocks.
 esp_err_t html_to_blocks(const char* html, size_t len, html_text_t* out);
+/// 带可选外部 CSS 样式表的 HTML 块提取；不修改纯文本字节偏移。/ HTML block extraction with optional external CSS; preserves plain-text byte offsets.
+esp_err_t html_to_blocks_css(const char* html, size_t len, const char* css, size_t css_len, html_text_t* out);
 /// 释放文本与块表并清零；可重复调用。/ Free text and blocks and reset; safe to repeat.
 void html_text_free(html_text_t* text);
 /// 释放块表及其图片，不释放正文；可传 NULL。/ Free blocks and their images without freeing text; NULL is allowed.

@@ -37,7 +37,7 @@ void app_settings_set_last_boot(uint8_t reason);
 /// 浅睡拿起唤醒。默认关；有加速度计也不会自动开。/ Light-sleep pickup wake. Defaults off; an accelerometer does not turn it on.
 bool app_settings_pickup_wake(void);
 void app_settings_set_pickup_wake(bool on);
-/// 阅读默认字号，36..72、步长 4，默认 48。/ Default reading size, 36..72 in steps of 4, initially 48.
+/// 阅读默认字号，32..72、步长 4，默认 48。/ Default reading size, 32..72 in steps of 4, initially 48.
 uint8_t app_settings_book_px(void);
 /// 无效字号恢复 48。/ Invalid sizes fall back to 48.
 void app_settings_set_book_px(uint8_t px);
@@ -49,3 +49,41 @@ void app_settings_set_book_shake(bool on);
 int16_t app_settings_tz_offset_min(void);
 /// 保存本地时区偏移（-720..+840）。/ Persist local timezone offset (-720..+840).
 void app_settings_set_tz_offset_min(int16_t minutes);
+/// 充电或连接 USB 数据线时阻止空闲自动休眠，默认开启。
+/// Prevent idle auto-sleep while charging or connected to a USB data host; defaults on.
+bool app_settings_keep_awake_usb(void);
+/// 保存充电/USB 不休眠开关。/ Persist the keep-awake-on-charging/USB switch.
+void app_settings_set_keep_awake_usb(bool on);
+/// 保持 Wi-Fi 连接总开关（配合 WIFI_PS_MAX_MODEM 省电），默认开启。
+/// Master switch to keep STA Wi-Fi connected (using WIFI_PS_MAX_MODEM); defaults on.
+bool app_settings_keep_wifi(void);
+/// 保存保持 Wi-Fi 连接开关。/ Persist the keep-Wi-Fi-connected switch.
+void app_settings_set_keep_wifi(bool on);
+/// 仅在充电或连接 USB 数据线时保持 Wi-Fi，拔线后自动断开省电，默认开启。
+/// Keep Wi-Fi only while charging or USB-connected; disconnects on battery. Defaults on.
+bool app_settings_keep_wifi_usb_only(void);
+/// 保存仅充电/USB 保持 Wi-Fi 开关。/ Persist the keep-Wi-Fi-only-on-charging/USB switch.
+void app_settings_set_keep_wifi_usb_only(bool on);
+
+/// 阅读行距增量百分比（相对字号，如 50 表示 1.5x 行高），默认 50。
+/// Reading line-spacing extra percentage relative to font size (50 = 1.5x line height); default 50.
+uint8_t app_settings_reader_line_pct(void);
+void app_settings_set_reader_line_pct(uint8_t pct);
+/// 阅读左右页边距（像素，16..80），默认 40。/ Reading horizontal page margin in pixels (16..80); default 40.
+uint8_t app_settings_reader_margin(void);
+void app_settings_set_reader_margin(uint8_t margin_px);
+/// 阅读段间距百分比（相对字号，0..120），默认 35。/ Paragraph spacing percentage of font size (0..120); default 35.
+uint8_t app_settings_reader_para_pct(void);
+void app_settings_set_reader_para_pct(uint8_t pct);
+/// 阅读正文首行缩进（2 个全角字宽），默认开启。/ First-line 2-em indent for body paragraphs; default on.
+bool app_settings_reader_indent(void);
+void app_settings_set_reader_indent(bool on);
+/// 阅读对齐方式：0=两端对齐，1=左对齐，默认 0。/ Reading alignment: 0=justify, 1=left; default 0.
+uint8_t app_settings_reader_align(void);
+void app_settings_set_reader_align(uint8_t align);
+/// 阅读正文插图模式：0=混排显示，1=占位点击，2=隐藏，默认 0。/ Inline image mode: 0=inline, 1=placeholder, 2=hide; default 0.
+uint8_t app_settings_reader_img_mode(void);
+void app_settings_set_reader_img_mode(uint8_t mode);
+/// 启用 EPUB 内嵌样式（标题层级/引用/居中/加粗/分割线），默认开启。/ Enable EPUB embedded styles; default on.
+bool app_settings_reader_epub_style(void);
+void app_settings_set_reader_epub_style(bool on);

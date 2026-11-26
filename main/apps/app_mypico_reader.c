@@ -48,6 +48,7 @@
 #define READER_IDLE_CAP_MS 90000
 #define READER_FLUSH_INTERVAL_MS 60000
 #define READER_PMU_POLL_MS 30000
+#define READER_INLINE_IMG_BUDGET (4u * 1024u * 1024u)
 
 // 删除气泡尺寸（Figma 80×58 + 三角 32×16 × 1.17）。
 // Delete bubble metrics scaled from Figma (80x58 + triangle 32x16 x 1.17).
@@ -68,9 +69,10 @@ static html_text_t s_chapter;
 static size_t s_page;
 static int s_px = 40;
 
-// 视图覆盖层：工具栏、目录、插图预览。
-// Overlays: toolbar, TOC, illustration preview.
+// 视图覆盖层：工具栏、排版面板、目录、插图预览。
+// Overlays: toolbar, typography panel, TOC, illustration preview.
 static bool s_toolbar_open;
+static bool s_typo_open;
 static bool s_toc_open;
 static int s_toc_page;
 static uint8_t* s_preview_img;
@@ -111,15 +113,6 @@ void mypico_reader_set_target(const char* file_path, uint32_t file_size) {
     s_target_size = file_size;
 }
 
-static EpdRect body_rect(void) {
-    return (EpdRect){
-        .x = MYPICO_MARGIN,
-        .y = READER_BODY_TOP,
-        .width = MYPICO_CONTENT_W,
-        .height = READER_BODY_BOTTOM - READER_BODY_TOP,
-    };
-}
-
 static void clear_preview(void) {
     free(s_preview_img);
     s_preview_img = NULL;
@@ -137,6 +130,108 @@ static void clear_selection_state(void) {
     s_prev_bar_count = 0;
     memset(&s_sel_dirty_logical, 0, sizeof(s_sel_dirty_logical));
     continuous_du_reset();
+}
+
+static EpdRect body_rect(void) {
+    int margin = (int)app_settings_reader_margin();
+    if (margin < 16 || margin > 80) margin = MYPICO_MARGIN;
+    return (EpdRect){
+        .x = margin,
+        .y = READER_BODY_TOP,
+        .width = UI_LOCK_WIDTH - 2 * margin,
+        .height = READER_BODY_BOTTOM - READER_BODY_TOP,
+    };
+}
+
+static book_layout_style_t current_layout_style(void) {
+    return (book_layout_style_t){
+        .line_spacing_pct = app_settings_reader_line_pct(),
+        .para_spacing_pct = app_settings_reader_para_pct(),
+        .first_line_indent = app_settings_reader_indent(),
+        .align = app_settings_reader_align(),
+        .image_mode = app_settings_reader_img_mode(),
+        .embedded_style = app_settings_reader_epub_style(),
+        .cjk_kinsoku = true,
+    };
+}
+
+// 混排模式下按预算解码本章插图到 block->image；超预算或解码失败回退为点击占位。
+// Decode chapter images into block->image under PSRAM budget in inline mode; fall back to placeholders if over budget.
+static void sync_chapter_inline_images(void) {
+    if (!s_chapter.blocks || !s_chapter.count) return;
+    uint8_t mode = app_settings_reader_img_mode();
+    if (mode != BOOK_IMG_INLINE || book_kind() != BOOK_KIND_EPUB) {
+        for (size_t i = 0; i < s_chapter.count; ++i) {
+            if (s_chapter.blocks[i].image) {
+                free(s_chapter.blocks[i].image);
+                s_chapter.blocks[i].image = NULL;
+                s_chapter.blocks[i].image_width = 0;
+                s_chapter.blocks[i].image_height = 0;
+            }
+        }
+        return;
+    }
+    size_t used_bytes = 0;
+    for (size_t i = 0; i < s_chapter.count; ++i) {
+        blk_t* b = &s_chapter.blocks[i];
+        if (b->image) {
+            used_bytes += (size_t)b->image_width * b->image_height;
+            continue;
+        }
+        if (!b->image_src) continue;
+        if (used_bytes >= READER_INLINE_IMG_BUDGET) break;
+        uint8_t* pix = NULL;
+        uint16_t w = 0, h = 0;
+        if (book_chapter_load_image(s_chapter_idx, b->image_src, &pix, &w, &h) == ESP_OK && pix && w && h) {
+            size_t bytes = (size_t)w * h;
+            if (used_bytes + bytes <= READER_INLINE_IMG_BUDGET) {
+                b->image = pix;
+                b->image_width = w;
+                b->image_height = h;
+                used_bytes += bytes;
+            } else {
+                free(pix);
+            }
+        }
+    }
+}
+
+static bool relayout_chapter(size_t target_off, bool go_last_page) {
+    clear_delete_bubble();
+    clear_selection_state();
+    book_layout_free();
+
+    book_layout_style_t style = current_layout_style();
+    bool ok = book_layout_begin_blocks_styled(
+        s_chapter.utf8, s_chapter.len, s_chapter.blocks, s_chapter.count,
+        body_rect(), s_px, &style
+    );
+    if (!ok) {
+        snprintf(s_error_msg, sizeof(s_error_msg), "章节排版失败");
+        return false;
+    }
+
+    // 推进分页直到覆盖目标偏移或末页。
+    // Extend pagination until covering target_off or reaching the last page.
+    while (!book_layout_complete()) {
+        if (!go_last_page) {
+            size_t count = book_layout_page_count();
+            if (count > 0 && book_layout_page_start_offset(count) > target_off) break;
+        }
+        if (!book_layout_extend(4)) {
+            snprintf(s_error_msg, sizeof(s_error_msg), "分页超出上限");
+            return false;
+        }
+    }
+
+    if (go_last_page) {
+        size_t n = book_layout_page_count();
+        s_page = n > 0 ? n - 1 : 0;
+    } else {
+        s_page = book_layout_page_for_offset(target_off);
+    }
+    s_error_msg[0] = 0;
+    return true;
 }
 
 static uint8_t compute_progress_pct(void) {
@@ -221,35 +316,8 @@ static bool load_chapter(size_t idx, size_t target_off, bool go_last_page) {
     }
 
     s_chapter_idx = idx;
-    bool ok = book_layout_begin_blocks(
-        s_chapter.utf8, s_chapter.len, s_chapter.blocks, s_chapter.count, body_rect(), s_px
-    );
-    if (!ok) {
-        snprintf(s_error_msg, sizeof(s_error_msg), "章节排版失败");
-        return false;
-    }
-
-    // 推进分页直到覆盖目标偏移或末页。
-    // Extend pagination until covering target_off or reaching the last page.
-    while (!book_layout_complete()) {
-        if (!go_last_page) {
-            size_t count = book_layout_page_count();
-            if (count > 0 && book_layout_page_start_offset(count) > target_off) break;
-        }
-        if (!book_layout_extend(4)) {
-            snprintf(s_error_msg, sizeof(s_error_msg), "分页超出上限");
-            return false;
-        }
-    }
-
-    if (go_last_page) {
-        size_t n = book_layout_page_count();
-        s_page = n > 0 ? n - 1 : 0;
-    } else {
-        s_page = book_layout_page_for_offset(target_off);
-    }
-    s_error_msg[0] = 0;
-    return true;
+    sync_chapter_inline_images();
+    return relayout_chapter(target_off, go_last_page);
 }
 
 static void close_book_resources(void) {
@@ -441,11 +509,27 @@ static void commit_drag_selection(app_ctx_t* ctx) {
     clear_selection_state();
 }
 
-/* ---- 工具栏与目录几何 / Toolbar and TOC geometry ---- */
+/* ---- 工具栏、排版面板与目录几何 / Toolbar, typography sheet, and TOC geometry ---- */
 
-#define TOOLBAR_Y (UI_LOCK_HEIGHT - 216)
-#define TOOLBAR_H 216
+#define TOOLBAR_H 248
+#define TOOLBAR_Y (UI_LOCK_HEIGHT - TOOLBAR_H)
 #define TOOLBAR_BTN_COUNT 6
+
+#define TYPO_H 556
+#define TYPO_Y (UI_LOCK_HEIGHT - TYPO_H)
+#define TYPO_ROW_TOP (TYPO_Y + 72)
+#define TYPO_ROW_H 58
+#define TYPO_LABEL_W 96
+#define TYPO_OPT_X (MYPICO_MARGIN + TYPO_LABEL_W)
+#define TYPO_OPT_W (MYPICO_CONTENT_W - TYPO_LABEL_W)
+
+static const uint8_t k_line_opts[4] = { 30, 50, 70, 90 };
+static const char* const k_line_names[4] = { "紧凑", "标准", "舒朗", "宽松" };
+static const uint8_t k_margin_opts[4] = { 24, 40, 56, 72 };
+static const char* const k_margin_names[4] = { "窄", "适中", "宽", "超宽" };
+static const uint8_t k_para_opts[4] = { 0, 35, 65, 100 };
+static const char* const k_para_names[4] = { "无", "小", "中", "大" };
+static const char* const k_img_names[3] = { "混排显示", "点击占位", "隐藏" };
 
 static EpdRect toolbar_btn_rect(int idx) {
     int col = idx % 3;
@@ -455,10 +539,35 @@ static EpdRect toolbar_btn_rect(int idx) {
     int h = 72;
     return (EpdRect){
         .x = MYPICO_MARGIN + col * (w + gap),
-        .y = TOOLBAR_Y + 26 + row * (h + 16),
+        .y = TOOLBAR_Y + 62 + row * (h + 16),
         .width = w,
         .height = h,
     };
+}
+
+static void draw_option_pill(uint8_t* fb, EpdRect r, const char* label, bool selected, bool enabled) {
+    int font_px = ui_mypico_em_to_px(21);
+    if (selected) {
+        ui_fill_round_rect(fb, r, 6, UI_GRAY_BLACK);
+        int prev_w = ttf_get_weight();
+        ttf_set_weight(MYPICO_WGHT_MEDIUM);
+        ui_text_vc(fb, r.x + r.width / 2, r.y + r.height / 2, font_px, label, EPD_DRAW_ALIGN_CENTER, true);
+        ttf_set_weight(prev_w);
+    } else {
+        ui_mypico_draw_pill(fb, r, font_px, label, enabled);
+    }
+}
+
+static EpdRect typo_done_rect(void) {
+    return (EpdRect){ UI_LOCK_WIDTH - MYPICO_MARGIN - 104, TYPO_Y + 14, 104, 44 };
+}
+
+static EpdRect typo_seg_rect(int row, int col, int cols) {
+    int gap = 10;
+    int w = (TYPO_OPT_W - (cols - 1) * gap) / cols;
+    int h = 46;
+    int y = TYPO_ROW_TOP + row * TYPO_ROW_H + (TYPO_ROW_H - h) / 2;
+    return (EpdRect){ TYPO_OPT_X + col * (w + gap), y, w, h };
 }
 
 static void render_toolbar(uint8_t* fb) {
@@ -466,19 +575,183 @@ static void render_toolbar(uint8_t* fb) {
     ui_clear_rect_fast(fb, panel);
     ui_hairline(fb, TOOLBAR_Y, 0, UI_LOCK_WIDTH, UI_GRAY_BLACK);
 
+    // 顶部进度与章节名摘要行。/ Compact progress & chapter title header inside toolbar.
+    char info[64];
+    size_t p_cnt = book_layout_page_count();
+    snprintf(info, sizeof(info), "第 %u/%u%s 页 · %u%%",
+             (unsigned)(s_page + 1), (unsigned)(p_cnt ? p_cnt : 1),
+             book_layout_complete() ? "" : "+", (unsigned)compute_progress_pct());
+    int info_px = ui_mypico_em_to_px(21);
+    ui_text_vc(fb, MYPICO_MARGIN, TOOLBAR_Y + 32, info_px, info, EPD_DRAW_ALIGN_LEFT, false);
+
+    char ch_title[96] = "";
+    if (book_chapter_title(s_chapter_idx, ch_title, sizeof(ch_title)) == ESP_OK && ch_title[0]) {
+        int max_tw = MYPICO_CONTENT_W - ttf_text_width_px(info_px, info) - 24;
+        if (max_tw > 60) {
+            while (ch_title[0] && ttf_text_width_px(info_px, ch_title) > max_tw) {
+                size_t n = strlen(ch_title) - 1;
+                while (n > 0 && ((unsigned char)ch_title[n] & 0xC0) == 0x80) --n;
+                ch_title[n] = 0;
+            }
+            ui_text_vc(fb, UI_LOCK_WIDTH - MYPICO_MARGIN, TOOLBAR_Y + 32, info_px,
+                       ch_title, EPD_DRAW_ALIGN_RIGHT, false);
+        }
+    }
+
     char px_dec[24], px_inc[24];
     snprintf(px_dec, sizeof(px_dec), "字号- (%d)", s_px);
     snprintf(px_inc, sizeof(px_inc), "字号+ (%d)", s_px);
     const char* labels[TOOLBAR_BTN_COUNT] = {
-        "返回书架", "目录", "整屏强刷",
-        px_dec, px_inc, "收起工具栏",
+        "返回书架", "目录", "排版设置",
+        px_dec, px_inc, "整屏强刷",
     };
+    int btn_px = ui_mypico_em_to_px(24);
     for (int i = 0; i < TOOLBAR_BTN_COUNT; ++i) {
         bool en = true;
         if (i == 3) en = s_px > READER_PX_MIN;
         if (i == 4) en = s_px < READER_PX_MAX;
-        ui_mypico_draw_pill(fb, toolbar_btn_rect(i), 26, labels[i], en);
+        ui_mypico_draw_pill(fb, toolbar_btn_rect(i), btn_px, labels[i], en);
     }
+}
+
+static void render_typo_panel(uint8_t* fb) {
+    EpdRect panel = { 0, TYPO_Y, UI_LOCK_WIDTH, TYPO_H };
+    ui_clear_rect_fast(fb, panel);
+    ui_hairline(fb, TYPO_Y, 0, UI_LOCK_WIDTH, UI_GRAY_BLACK);
+
+    int prev_w = ttf_get_weight();
+    ttf_set_weight(MYPICO_WGHT_MEDIUM);
+    ui_text_vc(fb, MYPICO_MARGIN, TYPO_Y + 36, ui_mypico_em_to_px(25), "排版设置", EPD_DRAW_ALIGN_LEFT, false);
+    ttf_set_weight(prev_w);
+    draw_option_pill(fb, typo_done_rect(), "完成", true, true);
+    ui_hairline(fb, TYPO_Y + 66, MYPICO_MARGIN, MYPICO_CONTENT_W, UI_GRAY_LIGHT);
+
+    static const char* const row_labels[8] = {
+        "字号", "行距", "边距", "段距", "缩进", "对齐", "插图", "样式"
+    };
+    int lbl_px = ui_mypico_em_to_px(22);
+    for (int r = 0; r < 8; ++r) {
+        int cy = TYPO_ROW_TOP + r * TYPO_ROW_H + TYPO_ROW_H / 2;
+        ui_text_vc(fb, MYPICO_MARGIN, cy, lbl_px, row_labels[r], EPD_DRAW_ALIGN_LEFT, false);
+    }
+
+    // Row 0: 字号 / Font size
+    char sz_buf[16];
+    snprintf(sz_buf, sizeof(sz_buf), "%d px", s_px);
+    draw_option_pill(fb, typo_seg_rect(0, 0, 3), "A-", false, s_px > READER_PX_MIN);
+    EpdRect mid_sz = typo_seg_rect(0, 1, 3);
+    ui_text_vc(fb, mid_sz.x + mid_sz.width / 2, mid_sz.y + mid_sz.height / 2,
+               ui_mypico_em_to_px(22), sz_buf, EPD_DRAW_ALIGN_CENTER, false);
+    draw_option_pill(fb, typo_seg_rect(0, 2, 3), "A+", false, s_px < READER_PX_MAX);
+
+    // Row 1: 行距 / Line spacing
+    uint8_t cur_line = app_settings_reader_line_pct();
+    for (int c = 0; c < 4; ++c) {
+        draw_option_pill(fb, typo_seg_rect(1, c, 4), k_line_names[c], cur_line == k_line_opts[c], true);
+    }
+
+    // Row 2: 页边距 / Margins
+    uint8_t cur_margin = app_settings_reader_margin();
+    for (int c = 0; c < 4; ++c) {
+        draw_option_pill(fb, typo_seg_rect(2, c, 4), k_margin_names[c], cur_margin == k_margin_opts[c], true);
+    }
+
+    // Row 3: 段间距 / Paragraph spacing
+    uint8_t cur_para = app_settings_reader_para_pct();
+    for (int c = 0; c < 4; ++c) {
+        draw_option_pill(fb, typo_seg_rect(3, c, 4), k_para_names[c], cur_para == k_para_opts[c], true);
+    }
+
+    // Row 4: 首行缩进 / First-line indent
+    bool cur_ind = app_settings_reader_indent();
+    draw_option_pill(fb, typo_seg_rect(4, 0, 2), "首行两字", cur_ind, true);
+    draw_option_pill(fb, typo_seg_rect(4, 1, 2), "不缩进", !cur_ind, true);
+
+    // Row 5: 对齐方式 / Alignment
+    uint8_t cur_al = app_settings_reader_align();
+    draw_option_pill(fb, typo_seg_rect(5, 0, 2), "两端对齐", cur_al == BOOK_ALIGN_JUSTIFY, true);
+    draw_option_pill(fb, typo_seg_rect(5, 1, 2), "左对齐", cur_al == BOOK_ALIGN_LEFT, true);
+
+    // Row 6: 正文插图 / Inline image mode
+    uint8_t cur_img = app_settings_reader_img_mode();
+    for (int c = 0; c < 3; ++c) {
+        draw_option_pill(fb, typo_seg_rect(6, c, 3), k_img_names[c], cur_img == (uint8_t)c, true);
+    }
+
+    // Row 7: EPUB 内嵌样式 / Embedded EPUB style
+    bool cur_st = app_settings_reader_epub_style();
+    draw_option_pill(fb, typo_seg_rect(7, 0, 2), "EPUB 精排", cur_st, true);
+    draw_option_pill(fb, typo_seg_rect(7, 1, 2), "简洁纯文本", !cur_st, true);
+}
+
+static app_redraw_t handle_typo_tap(int x, int y) {
+    if (y < TYPO_Y || ui_rect_hit(typo_done_rect(), x, y)) {
+        s_typo_open = false;
+        return APP_REDRAW_PAGE;
+    }
+
+    size_t off = book_layout_page_start_offset(s_page);
+    bool changed = false;
+    bool img_changed = false;
+
+    if (ui_rect_hit(typo_seg_rect(0, 0, 3), x, y) && s_px > READER_PX_MIN) {
+        s_px -= READER_PX_STEP;
+        app_settings_set_book_px((uint8_t)s_px);
+        changed = true;
+    } else if (ui_rect_hit(typo_seg_rect(0, 2, 3), x, y) && s_px < READER_PX_MAX) {
+        s_px += READER_PX_STEP;
+        app_settings_set_book_px((uint8_t)s_px);
+        changed = true;
+    }
+    for (int c = 0; !changed && c < 4; ++c) {
+        if (ui_rect_hit(typo_seg_rect(1, c, 4), x, y) && app_settings_reader_line_pct() != k_line_opts[c]) {
+            app_settings_set_reader_line_pct(k_line_opts[c]);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(2, c, 4), x, y) && app_settings_reader_margin() != k_margin_opts[c]) {
+            app_settings_set_reader_margin(k_margin_opts[c]);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(3, c, 4), x, y) && app_settings_reader_para_pct() != k_para_opts[c]) {
+            app_settings_set_reader_para_pct(k_para_opts[c]);
+            changed = true;
+        }
+    }
+    if (!changed) {
+        if (ui_rect_hit(typo_seg_rect(4, 0, 2), x, y) && !app_settings_reader_indent()) {
+            app_settings_set_reader_indent(true);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(4, 1, 2), x, y) && app_settings_reader_indent()) {
+            app_settings_set_reader_indent(false);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(5, 0, 2), x, y) && app_settings_reader_align() != BOOK_ALIGN_JUSTIFY) {
+            app_settings_set_reader_align(BOOK_ALIGN_JUSTIFY);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(5, 1, 2), x, y) && app_settings_reader_align() != BOOK_ALIGN_LEFT) {
+            app_settings_set_reader_align(BOOK_ALIGN_LEFT);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(7, 0, 2), x, y) && !app_settings_reader_epub_style()) {
+            app_settings_set_reader_epub_style(true);
+            changed = true;
+        } else if (ui_rect_hit(typo_seg_rect(7, 1, 2), x, y) && app_settings_reader_epub_style()) {
+            app_settings_set_reader_epub_style(false);
+            changed = true;
+        } else {
+            for (int c = 0; c < 3; ++c) {
+                if (ui_rect_hit(typo_seg_rect(6, c, 3), x, y) && app_settings_reader_img_mode() != (uint8_t)c) {
+                    app_settings_set_reader_img_mode((uint8_t)c);
+                    changed = true;
+                    img_changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (changed) {
+        if (img_changed) sync_chapter_inline_images();
+        (void)relayout_chapter(off, false);
+        return APP_REDRAW_PAGE;
+    }
+    return APP_REDRAW_NONE;
 }
 
 static void render_toc(uint8_t* fb) {
@@ -576,6 +849,7 @@ static void reader_on_enter(app_ctx_t* ctx) {
     close_book_resources();
     ui_statusbar_poll_pmu();
     s_toolbar_open = false;
+    s_typo_open = false;
     s_toc_open = false;
     s_error_msg[0] = 0;
     s_act_last_ms = ctx ? ctx->now_ms : 0;
@@ -591,7 +865,9 @@ static void reader_on_enter(app_ctx_t* ctx) {
 
     book_data_record_init(&s_rec);
     (void)book_data_load(s_target_path, s_target_size, &s_rec);
-    s_px = s_rec.px >= READER_PX_MIN && s_rec.px <= READER_PX_MAX ? s_rec.px : 40;
+    int def_px = (int)app_settings_book_px();
+    if (def_px < READER_PX_MIN || def_px > READER_PX_MAX) def_px = 40;
+    s_px = s_rec.px >= READER_PX_MIN && s_rec.px <= READER_PX_MAX ? s_rec.px : def_px;
 
     ESP_LOGI(TAG, "opening %s (%u bytes)", s_target_path, (unsigned)s_target_size);
     esp_err_t err = book_open(s_target_path);
@@ -654,7 +930,9 @@ static void reader_render(app_ctx_t* ctx, uint8_t* fb) {
     if (s_delete_hl_id != 0) {
         draw_delete_bubble(fb);
     }
-    if (s_toolbar_open) {
+    if (s_typo_open) {
+        render_typo_panel(fb);
+    } else if (s_toolbar_open) {
         render_toolbar(fb);
     }
 }
@@ -721,7 +999,7 @@ static app_redraw_t reader_on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* 
 
     // 长按正文：进入跟手拖选划线模式（continuous_du）。
     // Long-press on body text: enter finger-following drag highlight mode.
-    if (ev->type == UI_GESTURE_LONG_PRESS && !s_toolbar_open && s_delete_hl_id == 0) {
+    if (ev->type == UI_GESTURE_LONG_PRESS && !s_toolbar_open && !s_typo_open && s_delete_hl_id == 0) {
         size_t cs = 0, ce = 0;
         if (book_layout_char_at(s_page, body_rect(), ev->x0, ev->y0, &cs, &ce, NULL)) {
             clear_selection_state();
@@ -750,6 +1028,15 @@ static app_redraw_t reader_on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* 
         return APP_REDRAW_NONE;
     }
 
+    // 排版设置面板打开时的点击处理。
+    // Typography settings sheet tap dispatch when open.
+    if (s_typo_open) {
+        if (ev->type == UI_GESTURE_TAP) {
+            return handle_typo_tap(ev->x0, ev->y0);
+        }
+        return APP_REDRAW_NONE;
+    }
+
     // 底部工具栏打开时的点击处理。
     // Toolbar tap dispatch when open.
     if (s_toolbar_open) {
@@ -769,25 +1056,26 @@ static app_redraw_t reader_on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* 
                 }
                 if (i == 2) {
                     s_toolbar_open = false;
-                    return APP_REDRAW_FULL;
+                    s_typo_open = true;
+                    return APP_REDRAW_PAGE;
                 }
                 if (i == 3 && s_px > READER_PX_MIN) {
                     size_t off = book_layout_page_start_offset(s_page);
                     s_px -= READER_PX_STEP;
                     app_settings_set_book_px((uint8_t)s_px);
-                    (void)load_chapter(s_chapter_idx, off, false);
+                    (void)relayout_chapter(off, false);
                     return APP_REDRAW_PAGE;
                 }
                 if (i == 4 && s_px < READER_PX_MAX) {
                     size_t off = book_layout_page_start_offset(s_page);
                     s_px += READER_PX_STEP;
                     app_settings_set_book_px((uint8_t)s_px);
-                    (void)load_chapter(s_chapter_idx, off, false);
+                    (void)relayout_chapter(off, false);
                     return APP_REDRAW_PAGE;
                 }
                 if (i == 5) {
                     s_toolbar_open = false;
-                    return APP_REDRAW_PAGE;
+                    return APP_REDRAW_FULL;
                 }
             }
             if ((int)ev->y0 < TOOLBAR_Y) {
@@ -882,10 +1170,20 @@ static app_redraw_t reader_on_key(app_ctx_t* ctx, int key) {
         if (key == UI_KEY_3 && s_toc_page < max_toc) { s_toc_page++; return APP_REDRAW_PAGE; }
         return APP_REDRAW_NONE;
     }
-    if (key == UI_KEY_1) return turn_prev_page(ctx);
-    if (key == UI_KEY_3) return turn_next_page(ctx);
+    if (key == UI_KEY_1) {
+        if (s_typo_open) { s_typo_open = false; return APP_REDRAW_PAGE; }
+        return turn_prev_page(ctx);
+    }
+    if (key == UI_KEY_3) {
+        if (s_typo_open) { s_typo_open = false; return APP_REDRAW_PAGE; }
+        return turn_next_page(ctx);
+    }
     if (key == UI_KEY_2) {
         clear_delete_bubble();
+        if (s_typo_open) {
+            s_typo_open = false;
+            return APP_REDRAW_PAGE;
+        }
         s_toolbar_open = !s_toolbar_open;
         return APP_REDRAW_PAGE;
     }
@@ -896,6 +1194,7 @@ static app_redraw_t reader_on_key_long(app_ctx_t* ctx, int key) {
     (void)ctx;
     if (key == UI_KEY_2) {
         s_toolbar_open = false;
+        s_typo_open = false;
         return APP_REDRAW_FULL;
     }
     return APP_REDRAW_NONE;

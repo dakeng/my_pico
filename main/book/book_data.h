@@ -36,10 +36,10 @@ extern "C" {
 #define BOOK_DATA_HL_TEXT_MAX 512
 #define BOOK_DATA_MAX_HIGHLIGHTS 256
 
-// 书架卡片封面缩略图标准尺寸（对应 Figma 130×180 × 1.17）。
-// Standard shelf cover thumbnail dimensions (Figma 130x180 scaled by 1.17).
-#define BOOK_COVER_W 152
-#define BOOK_COVER_H 210
+// 书架卡片封面缩略图标准尺寸（对应 Figma 144×200 × 76/65）。
+// Standard shelf cover thumbnail dimensions (Figma 144x200 scaled by 76/65).
+#define BOOK_COVER_W 168
+#define BOOK_COVER_H 234
 
 typedef struct {
     uint32_t id;                         ///< 递增唯一 ID / Monotonic highlight ID

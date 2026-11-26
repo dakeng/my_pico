@@ -19,13 +19,20 @@
 #include "settings.h"
 #include "ttf_font.h"
 
-// 浅灰底色（近似 Figma rgba(0,0,0,0.06) 在 4bpp 灰度下的表现：0xE0）。
-// Light gray fill approximating Figma rgba(0,0,0,0.06) in 4bpp grayscale (0xE0).
-#define MYPICO_PILL_BG 0xE0
-#define MYPICO_PILL_BG_DISABLED 0xF0
-#define MYPICO_PILL_RADIUS 6
-#define MYPICO_STATUS_PX 22
-#define MYPICO_BAR_PX 28
+// 浅灰底色（匹配黑色 10% 透明度在 4bpp 灰度下的近似阶：0xD0；禁用态保持更浅的 0xE0）。
+// Light gray fill approximating 10% black opacity in 4bpp (0xD0); disabled uses lighter 0xE0.
+#define MYPICO_PILL_BG 0xD0
+#define MYPICO_PILL_BG_DISABLED 0xE0
+#define MYPICO_PILL_RADIUS 5
+#define MYPICO_STATUS_EM 18
+#define MYPICO_BAR_EM 28
+// 底部操作栏按钮：四边 padding 16 (×76/65 ≈ 19px)，高 74px，居中于 110px 操作栏内。
+// Bottom action bar pills: 16px all-around padding (x76/65 ~= 19px), 74px tall, centered in 110px bar.
+#define MYPICO_BAR_BTN_H 74
+#define MYPICO_BAR_BTN_Y (MYPICO_ACTIONBAR_Y + (MYPICO_ACTIONBAR_H - MYPICO_BAR_BTN_H) / 2)
+#define MYPICO_BAR_HOME_W 94
+#define MYPICO_BAR_PAGE_W 122
+#define MYPICO_BAR_PAGE_GAP 28
 
 // Howard Hinnant civil_from_days：从 1970-01-01 起的天数换算公历年月日。
 // Howard Hinnant's civil_from_days: convert days since 1970-01-01 to calendar Y/M/D.
@@ -115,6 +122,17 @@ void ui_statusbar_format_duration(uint32_t total_sec, char out[24]) {
     }
 }
 
+int ui_mypico_em_to_px(int target_em_px) {
+    // 用汉字宽反推当前字体的 (ascent - descent) / unitsPerEm 比例，消除不同字体的视觉大小偏差。
+    // Calibrate pixel_height against a CJK em glyph so visual sizing matches Figma across any loaded font.
+    int ref_w = ttf_text_width_px(100, "页");
+    if (ref_w <= 20 || ref_w > 120) return target_em_px;
+    int px = (target_em_px * 100 + ref_w / 2) / ref_w;
+    if (px < 12) px = 12;
+    if (px > 120) px = 120;
+    return px;
+}
+
 void ui_statusbar_draw(uint8_t* fb) {
     if (!fb) return;
     EpdRect bar = {0, 0, UI_LOCK_WIDTH, MYPICO_STATUSBAR_H};
@@ -140,54 +158,59 @@ void ui_statusbar_draw(uint8_t* fb) {
     }
 
     const int cy = MYPICO_STATUSBAR_H / 2;
-    ui_text_vc(fb, MYPICO_MARGIN, cy, MYPICO_STATUS_PX, time_str, EPD_DRAW_ALIGN_LEFT, false);
+    const int px = ui_mypico_em_to_px(MYPICO_STATUS_EM);
+    const int old_wght = ttf_get_weight();
+    ttf_set_weight(MYPICO_WGHT_MEDIUM);
+    ui_text_vc(fb, MYPICO_MARGIN, cy, px, time_str, EPD_DRAW_ALIGN_LEFT, false);
     ui_text_vc(
-        fb, UI_LOCK_WIDTH - MYPICO_MARGIN, cy, MYPICO_STATUS_PX, bat_str,
+        fb, UI_LOCK_WIDTH - MYPICO_MARGIN, cy, px, bat_str,
         EPD_DRAW_ALIGN_RIGHT, false
     );
+    ttf_set_weight(old_wght);
 }
 
 EpdRect ui_mypico_bar_home_rect(void) {
     return (EpdRect){
         .x = MYPICO_MARGIN,
-        .y = MYPICO_ACTIONBAR_Y + 24,
-        .width = 96,
-        .height = 58,
+        .y = MYPICO_BAR_BTN_Y,
+        .width = MYPICO_BAR_HOME_W,
+        .height = MYPICO_BAR_BTN_H,
     };
 }
 
 EpdRect ui_mypico_bar_prev_rect(void) {
     return (EpdRect){
-        .x = UI_LOCK_WIDTH - MYPICO_MARGIN - 122 - 14 - 122,
-        .y = MYPICO_ACTIONBAR_Y + 24,
-        .width = 122,
-        .height = 58,
+        .x = UI_LOCK_WIDTH - MYPICO_MARGIN - MYPICO_BAR_PAGE_W - MYPICO_BAR_PAGE_GAP - MYPICO_BAR_PAGE_W,
+        .y = MYPICO_BAR_BTN_Y,
+        .width = MYPICO_BAR_PAGE_W,
+        .height = MYPICO_BAR_BTN_H,
     };
 }
 
 EpdRect ui_mypico_bar_next_rect(void) {
     return (EpdRect){
-        .x = UI_LOCK_WIDTH - MYPICO_MARGIN - 122,
-        .y = MYPICO_ACTIONBAR_Y + 24,
-        .width = 122,
-        .height = 58,
+        .x = UI_LOCK_WIDTH - MYPICO_MARGIN - MYPICO_BAR_PAGE_W,
+        .y = MYPICO_BAR_BTN_Y,
+        .width = MYPICO_BAR_PAGE_W,
+        .height = MYPICO_BAR_BTN_H,
     };
 }
 
 void ui_mypico_draw_pill(uint8_t* fb, EpdRect rect, int px, const char* label, bool enabled) {
     if (!fb || !label) return;
-    ui_fill_round_rect(
-        fb, rect, MYPICO_PILL_RADIUS,
-        enabled ? MYPICO_PILL_BG : MYPICO_PILL_BG_DISABLED
-    );
+    uint8_t bg8 = enabled ? MYPICO_PILL_BG : MYPICO_PILL_BG_DISABLED;
+    ui_fill_round_rect(fb, rect, MYPICO_PILL_RADIUS, bg8);
     uint8_t fg = enabled ? UI_INK_BLACK : 9;
+    const int old_wght = ttf_get_weight();
+    ttf_set_weight(MYPICO_WGHT_MEDIUM);
     int above = 0, below = 0;
     ttf_measure_line_px(px, label, &above, &below);
     int baseline = rect.y + rect.height / 2 + (above - below) / 2;
     ttf_draw_text_px(
         fb, rect.x + rect.width / 2, baseline, px, label,
-        EPD_DRAW_ALIGN_CENTER, fg, enabled ? 14 : 15
+        EPD_DRAW_ALIGN_CENTER, fg, (uint8_t)(bg8 >> 4)
     );
+    ttf_set_weight(old_wght);
 }
 
 void ui_mypico_draw_action_bar(
@@ -196,7 +219,8 @@ void ui_mypico_draw_action_bar(
     if (!fb) return;
     EpdRect bar = {0, MYPICO_ACTIONBAR_Y, UI_LOCK_WIDTH, MYPICO_ACTIONBAR_H};
     ui_clear_rect_fast(fb, bar);
-    ui_mypico_draw_pill(fb, ui_mypico_bar_home_rect(), MYPICO_BAR_PX, left_label ? left_label : "首页", true);
-    ui_mypico_draw_pill(fb, ui_mypico_bar_prev_rect(), MYPICO_BAR_PX, "上一页", can_prev);
-    ui_mypico_draw_pill(fb, ui_mypico_bar_next_rect(), MYPICO_BAR_PX, "下一页", can_next);
+    const int bar_px = ui_mypico_em_to_px(MYPICO_BAR_EM);
+    ui_mypico_draw_pill(fb, ui_mypico_bar_home_rect(), bar_px, left_label ? left_label : "首页", true);
+    ui_mypico_draw_pill(fb, ui_mypico_bar_prev_rect(), bar_px, "上一页", can_prev);
+    ui_mypico_draw_pill(fb, ui_mypico_bar_next_rect(), bar_px, "下一页", can_next);
 }

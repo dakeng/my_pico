@@ -23,7 +23,8 @@ static bool home_on_touch, home_on_tick, home_on_key, start_second;
 static int home_enters, home_renders, last_menu_leaf, rendered_leaf;
 static const app_desc_t* menu_background;
 static app_desc_t first, second;
-static bool full_tick, lock_due, font_due;
+static bool full_tick, lock_due, font_due, key_short_due, keep_awake_due;
+static int lock_calls;
 static int64_t time_offset, time_step;
 static int du_areas, gl_areas;
 static bool media_test, sd_font, saved_sd_font;
@@ -50,9 +51,11 @@ enum EpdDrawError update_display_white(EpdiyHighlevelState*h) {(void)h;return 0;
 bool display_take_white_exit(void) {return false;}
 void rails_idle_check(int64_t n) {(void)n;}
 bool read_pico_pmu_ready(void) {return lock_due;}
-bool read_pico_pmu_take_key_short(void) {return true;}
-void enter_lock_and_sleep(EpdiyHighlevelState*h,int64_t*t,void*a) {(void)h;(void)t;(void)a;lock_due=false;time_offset+=1000000;}
+bool read_pico_pmu_take_key_short(void) {return key_short_due;}
+void enter_lock_and_sleep(EpdiyHighlevelState*h,int64_t*t,void*a) {(void)h;(void)t;(void)a;lock_calls++;lock_due=false;time_offset+=1000000;}
 bool app_lock_powers_down(void) {return false;}
+bool app_sleep_keep_awake_active(void) {return keep_awake_due;}
+void mypico_wifi_tick(int64_t n) {(void)n;}
 const char* app_settings_font_path(void) {return "builtin";}
 bool ttf_font_path_is_builtin(const char*p) {(void)p;return !font_due&&!saved_sd_font;}
 bool ttf_font_ready(void) {return true;}
@@ -107,7 +110,7 @@ static void reset(void) {
     long_keys=0;
     home_on_touch=home_on_tick=home_on_key=start_second=false;
     home_enters=home_renders=0;rendered_leaf=-1;last_menu_leaf=-1;menu_background=NULL;
-    full_tick=lock_due=font_due=false;time_offset=0;time_step=10000;du_areas=gl_areas=0;
+    full_tick=lock_due=font_due=keep_awake_due=false;key_short_due=true;lock_calls=0;time_offset=0;time_step=10000;du_areas=gl_areas=0;
     memset(samples,0,sizeof(samples));memset(keys,0,sizeof(keys));memset(events,0,sizeof(events));memset(tick_consumed,0,sizeof(tick_consumed));
     sample_count=step=ticks=enters=exits=touch_calls=menus=highlights=restores=fulls=mode=0;
     request_on_touch=request_on_tick=menu_on_tick=menu_on_touch=cancel_clobber=false;response=APP_REDRAW_NONE;
@@ -235,6 +238,14 @@ int main(void) {
     reset();media_test=sd_font=saved_sd_font=true;mounted_steps[0]=mounted_steps[2]=true;time_step=4000000;first.on_media_lost=lost;
     add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);run();
     assert(media_lost==2&&builtin_opens==2&&!probes&&font_opens==2);
-    puts("app_loop: 42 scheduler scenarios passed");
+    // 充电或连 USB 数据线保持唤醒时，空闲超时不锁屏；关闭后空闲超时正常锁屏。
+    // Keep-awake on charging/USB blocks idle auto-sleep; disabling it allows idle lock.
+    reset();lock_due=true;key_short_due=false;keep_awake_due=true;time_step=70000000;
+    add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);run();
+    assert(lock_calls==0);
+    reset();lock_due=true;key_short_due=false;keep_awake_due=false;time_step=70000000;
+    add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);run();
+    assert(lock_calls==1);
+    puts("app_loop: 44 scheduler scenarios passed");
     return 0;
 }

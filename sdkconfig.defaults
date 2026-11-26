@@ -47,3 +47,8 @@ CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=1024
+
+# SNTP 网络校时：配置 3 个备用服务器且取消启动随机延时，连上 Wi-Fi 后立刻对时。
+# SNTP time sync: 3 fallback servers and no random startup delay for fast calibration.
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+CONFIG_LWIP_SNTP_STARTUP_DELAY=n
